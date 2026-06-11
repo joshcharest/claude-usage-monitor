@@ -126,6 +126,28 @@ The index lives in `~/.claude/usage-index.db` (separate from `budget.db`, never
 committed). Re-indexing is incremental — only changed/new transcripts are
 re-parsed — and the dashboard keeps it warm automatically.
 
+### Auto-start on every Claude session
+
+`scripts/ensure-dashboard.sh` idempotently ensures the dashboard is running: if
+it's already serving it exits immediately, otherwise it refreshes the index and
+starts the server detached (one server shared across all sessions). Wire it to a
+Claude Code **SessionStart** hook in `~/.claude/settings.json`:
+
+```jsonc
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command",
+                     "command": "~/claude-usage-monitor/scripts/ensure-dashboard.sh",
+                     "async": true } ] }
+    ]
+  }
+}
+```
+
+Override the port or repo location with `CLAUDE_USAGE_DASHBOARD_PORT` /
+`CLAUDE_USAGE_MONITOR_DIR`. Logs go to `~/.claude/usage-dashboard.log`.
+
 ## Roadmap
 
 - **Phase 1:** monitor + pace forecast + recommendation seam (done).
