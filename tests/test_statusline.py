@@ -15,6 +15,36 @@ SAMPLE = {
 }
 
 
+def test_fmt_clock_matches_local_time():
+    import datetime as _dt
+
+    epoch = 1_700_000_000.0
+    expected = _dt.datetime.fromtimestamp(epoch)
+    h = expected.hour % 12 or 12
+    ap = "a" if expected.hour < 12 else "p"
+    # now == epoch -> same day -> no weekday prefix.
+    assert statusline._fmt_clock(epoch, epoch) == f"{h}:{expected.minute:02d}{ap}"
+
+
+def test_fmt_clock_includes_weekday_when_not_today():
+    import datetime as _dt
+
+    epoch = 1_700_000_000.0
+    later = epoch + 3 * 86400  # 3 days on -> different date -> weekday prefix
+    s = statusline._fmt_clock(later, epoch)
+    assert s.split()[0] == _dt.datetime.fromtimestamp(later).strftime("%a")
+
+
+def test_segment_shows_reset_countdown_and_clock():
+    from claude_usage_monitor.forecast import forecast_from_period_start
+
+    now = 1_700_000_000.0
+    fc = forecast_from_period_start(30.0, 18000.0, now + 9000, now)  # resets in 2h30m
+    seg = statusline._window_segment("5h", fc, 90.0, now)
+    assert "2h30m · " in seg  # countdown AND a clock time follow
+    assert seg.rstrip(")").endswith(statusline._fmt_clock(now + 9000, now))
+
+
 def test_render_produces_line_and_records_sample(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_BUDGET_DB", str(tmp_path / "s.db"))
     config = load_config()

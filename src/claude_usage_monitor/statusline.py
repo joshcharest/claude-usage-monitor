@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from datetime import datetime
 from typing import Any
 
 from . import db
@@ -66,6 +67,19 @@ def _fmt_duration(secs: float | None) -> str:
     return f"{minutes}m"
 
 
+def _fmt_clock(epoch: float | None, now: float) -> str:
+    """Local wall-clock time of a reset, e.g. '5:42p' (or 'Thu 7:00a' if not today)."""
+    if epoch is None:
+        return "?"
+    dt = datetime.fromtimestamp(epoch)
+    hour = dt.hour % 12 or 12
+    ampm = "a" if dt.hour < 12 else "p"
+    clock = f"{hour}:{dt.minute:02d}{ampm}"
+    if dt.date() != datetime.fromtimestamp(now).date():
+        return dt.strftime("%a ") + clock
+    return clock
+
+
 def _glyph(fc: WindowForecast, warn_pct: float) -> str:
     if fc.on_pace is None:
         return "·"
@@ -76,7 +90,7 @@ def _glyph(fc: WindowForecast, warn_pct: float) -> str:
     return "✅"
 
 
-def _window_segment(label: str, fc: WindowForecast, warn_pct: float) -> str:
+def _window_segment(label: str, fc: WindowForecast, warn_pct: float, now: float) -> str:
     if fc.current_pct is None:
         return f"{label} —"
     cur = f"{fc.current_pct:.0f}%"
@@ -84,6 +98,8 @@ def _window_segment(label: str, fc: WindowForecast, warn_pct: float) -> str:
         return f"{label} {cur}"
     proj = f"proj {fc.projected_pct:.0f}%"
     reset = _fmt_duration(fc.secs_to_reset)
+    if fc.secs_to_reset is not None and fc.secs_to_reset >= 0:
+        reset = f"{reset} · {_fmt_clock(now + fc.secs_to_reset, now)}"
     return f"{label} {cur} → {proj} {_glyph(fc, warn_pct)} ({reset})"
 
 
@@ -118,8 +134,8 @@ def render(payload: dict[str, Any], now: float, config: dict[str, Any]) -> str:
         parts.append(str(model))
     if sample.ctx_used_pct is not None:
         parts.append(f"ctx {sample.ctx_used_pct:.0f}%")
-    parts.append(_window_segment("5h", fc_5h, warn))
-    parts.append(_window_segment("7d", fc_7d, warn))
+    parts.append(_window_segment("5h", fc_5h, warn, now))
+    parts.append(_window_segment("7d", fc_7d, warn, now))
 
     return "  ·  ".join(parts)
 
