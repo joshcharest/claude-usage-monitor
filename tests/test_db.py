@@ -34,3 +34,32 @@ def test_schema_created_on_first_connect(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_BUDGET_DB", str(tmp_path / "fresh.db"))
     rows = db.recent(window_seconds=1000, now=0.0)  # must not raise
     assert rows == []
+
+
+def test_effort_and_fast_mode_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_BUDGET_DB", str(tmp_path / "test.db"))
+    db.ingest(Sample(ts=1.0, effort="high", fast_mode=False))
+    db.ingest(Sample(ts=2.0, effort="low", fast_mode=True))
+    rows = db.recent(window_seconds=100, now=2.0)
+    assert rows[0]["effort"] == "high"
+    assert rows[0]["fast_mode"] == 0  # bool stored as int
+    assert rows[1]["effort"] == "low"
+    assert rows[1]["fast_mode"] == 1
+
+
+def test_additive_columns_migrate_existing_db(tmp_path, monkeypatch):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    # Simulate a pre-release DB without the additive columns.
+    legacy = sqlite3.connect(path)
+    legacy.execute("CREATE TABLE samples (id INTEGER PRIMARY KEY, ts REAL NOT NULL)")
+    legacy.commit()
+    legacy.close()
+
+    monkeypatch.setenv("CLAUDE_BUDGET_DB", str(path))
+    conn = db.connect()  # must add missing columns without error
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(samples)")}
+    conn.close()
+    assert "effort" in cols
+    assert "fast_mode" in cols

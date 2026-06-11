@@ -42,6 +42,8 @@ def _sample_from_payload(payload: dict[str, Any], now: float) -> db.Sample:
         ts=now,
         session_id=_get(payload, "session_id"),
         model=_get(payload, "model", "id"),
+        effort=_get(payload, "effort", "level"),
+        fast_mode=_get(payload, "fast_mode"),
         cost_usd=_get(payload, "cost", "total_cost_usd"),
         ctx_used_pct=_get(payload, "context_window", "used_percentage"),
         used_pct_5h=_get(payload, "rate_limits", "five_hour", "used_percentage"),

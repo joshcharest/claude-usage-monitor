@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS samples (
     ts            REAL    NOT NULL,
     session_id    TEXT,
     model         TEXT,
+    effort        TEXT,
+    fast_mode     INTEGER,
     cost_usd      REAL,
     ctx_used_pct  REAL,
     used_pct_5h   REAL,
@@ -30,6 +32,13 @@ CREATE TABLE IF NOT EXISTS samples (
 CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts);
 """
 
+# Columns added after the initial release. Ensured on existing DBs so the schema
+# can grow without a manual migration. (column_name -> SQLite type)
+_ADDITIVE_COLUMNS = {
+    "effort": "TEXT",
+    "fast_mode": "INTEGER",
+}
+
 
 @dataclass
 class Sample:
@@ -38,6 +47,8 @@ class Sample:
     ts: float
     session_id: str | None = None
     model: str | None = None
+    effort: str | None = None
+    fast_mode: bool | None = None
     cost_usd: float | None = None
     ctx_used_pct: float | None = None
     used_pct_5h: float | None = None
@@ -59,7 +70,17 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
+    _ensure_columns(conn)
     return conn
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    """Add any additive columns missing from a pre-existing ``samples`` table."""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(samples)")}
+    for column, sql_type in _ADDITIVE_COLUMNS.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE samples ADD COLUMN {column} {sql_type}")
+    conn.commit()
 
 
 def ingest(sample: Sample, conn: sqlite3.Connection | None = None) -> None:
