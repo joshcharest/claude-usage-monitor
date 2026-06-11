@@ -19,6 +19,22 @@ from claude_usage_monitor.dashboard import data, kpi, panels, prep
 
 st.set_page_config(page_title="Claude Usage Monitor", layout="wide")
 
+# Reclaim the large default top padding and tighten vertical spacing so the
+# whole dashboard fits on screen without scrolling.
+st.markdown(
+    """
+    <style>
+      .block-container { padding-top: 1.2rem; padding-bottom: 1rem; }
+      [data-testid="stHeader"] { height: 0; }
+      [data-testid="stVerticalBlock"] { gap: 0.4rem; }
+      [data-testid="stMetric"] { padding: 2px 0; }
+      h1, h2, h3 { margin: 0.2rem 0; padding: 0; }
+      .stCaption, [data-testid="stCaptionContainer"] { margin-top: -0.3rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 def _sidebar(config: dict) -> prep.Controls:
     st.sidebar.title("Claude Usage")
@@ -72,8 +88,6 @@ def main_render() -> None:
 
     controls = _sidebar(config)
     refresh = "5s" if controls.live else None
-
-    st.title("Claude Usage Monitor")
 
     @st.fragment(run_every=refresh)
     def _kpi_row():

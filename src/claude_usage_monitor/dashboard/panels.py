@@ -112,7 +112,7 @@ def _cumulative_usage_chart(df, resets=None):
             color="#e4572e", strokeWidth=2
         ).encode(x="time:T")
         layers.append(vlines)
-    return alt.layer(*layers).properties(height=280)
+    return alt.layer(*layers).properties(height=200)
 
 
 def _stacked_pace_chart(df, warn: float, resets=None):
@@ -142,7 +142,7 @@ def _stacked_pace_chart(df, warn: float, resets=None):
             color="#e4572e", strokeWidth=2
         ).encode(x="time:T")
         layers.append(vlines)
-    return alt.layer(*layers).properties(height=360)
+    return alt.layer(*layers).properties(height=260)
 
 
 def render_usage(controls: Controls, config: dict) -> None:
