@@ -43,8 +43,8 @@ def pace_rows(which: str, window_seconds: float | None) -> list[dict]:
 
 
 @st.cache_data(ttl=60)
-def session_titles(_gen: str) -> dict:
-    return queries.session_titles()
+def session_labels(_gen: str) -> dict:
+    return queries.session_labels()
 
 
 @st.cache_data(ttl=30)

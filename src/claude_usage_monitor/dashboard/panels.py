@@ -53,45 +53,45 @@ def render_pace(controls: Controls, config: dict) -> None:
     c3.metric("Status",
               "on pace" if on_pace else ("over budget" if on_pace is False else "—"))
 
-    titles = data.session_titles(data.generation())
+    labels = data.session_labels(data.generation())
     bucket = prep.pace_bucket_seconds(controls.window_seconds, series)
-    df = prep.pace_stack_frame(series, titles, bucket)
+    df = prep.pace_active_frame(series, labels, bucket)
     warn = float(config.get("alerts", {}).get("warn_projected_pct", 90))
 
     if df.empty:
-        st.caption("Not enough samples to stack yet.")
+        st.caption("Not enough samples yet.")
         return
 
-    st.altair_chart(_stacked_pace_chart(df, warn), use_container_width=True)
+    st.altair_chart(_active_pace_chart(df, warn), use_container_width=True)
     st.caption(
-        f"Each band is one conversation's contribution to the {which} window; the "
-        f"stack top is the total used %. Smoothed to ~{int(bucket)}s buckets. "
-        f"Dashed lines: warn {warn:.0f}% and ceiling 100%."
+        f"Actual {which}-window used % over time (a rolling metric — it rises and "
+        f"falls as usage ages out), colored by the conversation most active in each "
+        f"~{int(bucket)}s bucket. Dashed lines: warn {warn:.0f}% and ceiling 100%."
     )
 
 
-def _stacked_pace_chart(df, warn: float):
+def _active_pace_chart(df, warn: float):
     area = (
         alt.Chart(df)
-        .mark_area()
+        .mark_area(opacity=0.85, interpolate="monotone")
         .encode(
             x=alt.X("time:T", title=None),
-            y=alt.Y("contribution:Q", stack=True, title="used % of window",
+            y=alt.Y("used_pct:Q", stack=None, title="used % of window",
                     scale=alt.Scale(domain=[0, 105])),
             color=alt.Color("conversation:N", legend=alt.Legend(title="conversation")),
             tooltip=["conversation:N",
-                     alt.Tooltip("contribution:Q", title="share %", format=".1f")],
+                     alt.Tooltip("used_pct:Q", title="used %", format=".0f")],
         )
     )
     refs = pd.DataFrame({"y": [warn, 100.0],
                          "label": [f"warn {warn:.0f}%", "ceiling 100%"]})
     rules = alt.Chart(refs).mark_rule(strokeDash=[6, 4], color="#999").encode(y="y:Q")
-    labels = (
+    rule_labels = (
         alt.Chart(refs)
         .mark_text(align="left", dx=5, dy=-5, color="#999")
         .encode(x=alt.value(5), y="y:Q", text="label:N")
     )
-    return (area + rules + labels).properties(height=360)
+    return (area + rules + rule_labels).properties(height=360)
 
 
 def render_usage(controls: Controls, config: dict) -> None:

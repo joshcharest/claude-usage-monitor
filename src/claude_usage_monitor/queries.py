@@ -242,15 +242,22 @@ def pace_timeseries(
     return out
 
 
-def session_titles(*, index_conn=None) -> dict[str, str]:
-    """Map ``session_id -> title`` from the conversation index (for labeling)."""
+def session_labels(*, index_conn=None) -> dict[str, str]:
+    """Map ``session_id -> human label`` for charts.
+
+    Prefers the ai-title, then the git branch (recognizable for untitled
+    worktree/side sessions), then a short session id.
+    """
     own = index_conn is None
     index_conn = index_conn or index_db.connect()
     try:
         rows = index_conn.execute(
-            "SELECT session_id, title FROM conversations WHERE title IS NOT NULL"
+            "SELECT session_id, title, git_branch FROM conversations"
         ).fetchall()
-        return {r["session_id"]: r["title"] for r in rows}
+        return {
+            r["session_id"]: (r["title"] or r["git_branch"] or r["session_id"][:8])
+            for r in rows
+        }
     finally:
         if own:
             index_conn.close()

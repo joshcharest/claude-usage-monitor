@@ -89,49 +89,35 @@ def test_usage_frame_long_format():
     assert len(df) == 3  # 2 5h + 1 7d (the None is dropped)
 
 
-def test_pace_stack_sums_to_total_used():
-    # Increments attributed to the active conversation; baseline -> (earlier).
-    series = [
-        {"ts": 1000.0, "session_id": "s1", "used_pct": 10.0},  # baseline 10
-        {"ts": 1001.0, "session_id": "s1", "used_pct": 20.0},  # +10 -> s1
-        {"ts": 1002.0, "session_id": "s2", "used_pct": 35.0},  # +15 -> s2
-        {"ts": 1003.0, "session_id": "s1", "used_pct": 40.0},  # +5  -> s1
-    ]
-    df = prep.pace_stack_frame(series, {"s1": "Chat one"})
-    last_t = df["time"].max()
-    stack_top = df[df["time"] == last_t]["contribution"].sum()
-    assert stack_top == pytest.approx(40.0)  # == final used_pct
-    convs = set(df["conversation"])
-    assert "Chat one" in convs and "s2" in convs
-    assert "(before monitoring)" in convs  # baseline band
-
-
-def test_pace_stack_ignores_resets():
-    # A drop (window reset / noise) must not subtract from the stack.
+def test_pace_active_frame_tracks_actual_not_overcounted():
+    # A rolling, oscillating used_pct: the chart must follow the actual value,
+    # never a cumulative sum of the up-moves.
     series = [
         {"ts": 1000.0, "session_id": "s1", "used_pct": 50.0},
-        {"ts": 1001.0, "session_id": "s1", "used_pct": 30.0},  # drop -> ignored
-        {"ts": 1002.0, "session_id": "s1", "used_pct": 40.0},  # +10 from 30
+        {"ts": 1001.0, "session_id": "s1", "used_pct": 20.0},  # drops (ages out)
+        {"ts": 1002.0, "session_id": "s1", "used_pct": 55.0},  # rises again
     ]
-    df = prep.pace_stack_frame(series, {})
-    last_t = df["time"].max()
-    # baseline 50 + s1's positive increment 10 = 60 (drop ignored).
-    assert df[df["time"] == last_t]["contribution"].sum() == pytest.approx(60.0)
+    df = prep.pace_active_frame(series, {"s1": "Chat one"})
+    assert df["used_pct"].max() == 55.0  # not 50+35=85 overcount
+    assert set(df["conversation"]) == {"Chat one"}
 
 
-def test_pace_stack_smooths_into_buckets():
+def test_pace_active_frame_bucket_dominant_and_mean():
+    # In one 60s bucket, s1 has more samples than s2 -> bucket colored s1.
     series = [
-        {"ts": 1000.0 + i * 10, "session_id": "s1", "used_pct": 10.0 + i}
-        for i in range(6)
+        {"ts": 1000.0, "session_id": "s1", "used_pct": 10.0},
+        {"ts": 1005.0, "session_id": "s1", "used_pct": 12.0},
+        {"ts": 1010.0, "session_id": "s2", "used_pct": 14.0},
     ]
-    raw = prep.pace_stack_frame(series, {})
-    bucketed = prep.pace_stack_frame(series, {}, bucket_seconds=60)
-    assert bucketed["time"].nunique() < raw["time"].nunique()  # fewer time points
+    df = prep.pace_active_frame(series, {"s1": "one"}, bucket_seconds=60)
+    assert len(df) == 1  # one 60s bucket
+    assert df["conversation"].iloc[0] == "one"  # dominant (2 of 3 samples)
+    assert df["used_pct"].iloc[0] == pytest.approx(12.0)  # mean of 10,12,14
 
 
-def test_pace_stack_empty():
-    df = prep.pace_stack_frame([])
-    assert list(df.columns) == ["time", "conversation", "contribution"]
+def test_pace_active_frame_empty():
+    df = prep.pace_active_frame([])
+    assert list(df.columns) == ["time", "conversation", "used_pct"]
 
 
 def test_pace_bucket_seconds():

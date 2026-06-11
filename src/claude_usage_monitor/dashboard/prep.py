@@ -205,8 +205,7 @@ def cost_frame(rows: list[dict]) -> pd.DataFrame:
                          "cost_usd": [r["cost_usd"] for r in rows]})
 
 
-_STACK_COLS = ["time", "conversation", "contribution"]
-_EARLIER = "(before monitoring)"
+_PACE_COLS = ["time", "conversation", "used_pct"]
 
 
 def pace_bucket_seconds(
@@ -229,59 +228,50 @@ def _label(session_id, titles: dict[str, str]) -> str:
     return titles.get(session_id) or (str(session_id)[:8] if session_id else "unknown")
 
 
-def pace_stack_frame(
+def pace_active_frame(
     series: list[dict],
-    titles: dict[str, str] | None = None,
+    labels: dict[str, str] | None = None,
     bucket_seconds: float | None = None,
 ) -> pd.DataFrame:
-    """Per-conversation cumulative contribution to window usage, for a stacked area.
+    """Actual window used % over time, colored by the active conversation.
 
-    Each increase in the window's used % between consecutive samples is
-    attributed to the conversation active at that moment. Cumulating those
-    increments per conversation and stacking them makes the top of the stack
-    equal the total used % (the consumption pace). The baseline usage already
-    present at the first sample is attributed to a ``(before monitoring)`` band
-    so the stack still sums to the absolute used %.
+    ``used_pct`` is an account-wide ROLLING metric (it rises and falls as usage
+    ages out), so it must NOT be cumulatively stacked. We instead plot the real
+    used % and color each time bucket by the conversation that was most active in
+    it. Within a bucket we take the mean used % and the dominant conversation.
 
-    Returns long-format rows ``(time, conversation, contribution)``. When
-    ``bucket_seconds`` is given the cumulative series is resampled (last value
-    per bucket) to smooth and thin the chart.
+    Returns ``(time, conversation, used_pct)`` — the chart height is always the
+    true used %, never an overcount.
     """
     if not series:
-        return pd.DataFrame(columns=_STACK_COLS)
+        return pd.DataFrame(columns=_PACE_COLS)
 
-    titles = titles or {}
+    labels = labels or {}
     df = pd.DataFrame(series)
     if "used_pct" not in df.columns or "session_id" not in df.columns:
-        return pd.DataFrame(columns=_STACK_COLS)
-    df["used"] = pd.to_numeric(df["used_pct"], errors="coerce")
-    df = df.dropna(subset=["used"]).sort_values("ts")
+        return pd.DataFrame(columns=_PACE_COLS)
+    df["used_pct"] = pd.to_numeric(df["used_pct"], errors="coerce")
+    df = df.dropna(subset=["used_pct"]).sort_values("ts")
     if df.empty:
-        return pd.DataFrame(columns=_STACK_COLS)
+        return pd.DataFrame(columns=_PACE_COLS)
 
-    df["conversation"] = df["session_id"].map(lambda s: _label(s, titles))
+    df["conversation"] = df["session_id"].map(lambda s: _label(s, labels))
     df["time"] = to_local(df["ts"])
-    # Positive increments only; resets/noise (drops) don't subtract.
-    df["delta"] = df["used"].diff().clip(lower=0).fillna(0.0)
-    baseline = float(df["used"].iloc[0])
-
-    # Cumulative contribution per conversation over the shared time axis.
-    pivot = df.pivot_table(
-        index="time", columns="conversation", values="delta", aggfunc="sum"
-    ).fillna(0.0)
-    cum = pivot.cumsum()
-    if baseline > 0:
-        cum.insert(0, _EARLIER, baseline)
 
     if bucket_seconds:
-        cum = cum.resample(f"{int(bucket_seconds)}s").last().ffill().dropna(how="all")
-
-    long = (
-        cum.reset_index()
-        .melt(id_vars="time", var_name="conversation", value_name="contribution")
-        .dropna(subset=["contribution"])
-    )
-    return long[_STACK_COLS]
+        df["bucket"] = df["time"].dt.floor(f"{int(bucket_seconds)}s")
+        grouped = df.groupby("bucket")
+        out = pd.DataFrame(
+            {
+                "time": grouped["used_pct"].mean().index,
+                "used_pct": grouped["used_pct"].mean().values,
+                "conversation": grouped["conversation"]
+                .agg(lambda s: s.value_counts().index[0])  # dominant conversation
+                .values,
+            }
+        )
+        return out[_PACE_COLS]
+    return df[_PACE_COLS].reset_index(drop=True)
 
 
 def model_frame(rows: list[dict]) -> pd.DataFrame:
