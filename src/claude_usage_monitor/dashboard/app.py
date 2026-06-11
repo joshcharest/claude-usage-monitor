@@ -89,6 +89,8 @@ def main_render() -> None:
     controls = _sidebar(config)
     refresh = "5s" if controls.live else None
 
+    st.markdown("### Claude Usage Monitor")
+
     @st.fragment(run_every=refresh)
     def _kpi_row():
         kpi.render_kpis(prep.build_kpis(data.latest_sample(), config, time.time()))
