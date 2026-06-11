@@ -23,7 +23,7 @@ from typing import Any
 
 from . import db
 from .config import load_config
-from .forecast import WindowForecast, forecast_from_period_start, forecast_window
+from .forecast import WindowForecast, forecast_from_period_start
 from .policy import recommend
 
 
@@ -91,25 +91,19 @@ def _window_segment(label: str, fc: WindowForecast, warn_pct: float) -> str:
 def render(payload: dict[str, Any], now: float, config: dict[str, Any]) -> str:
     """Build the status line, recording a sample as a side effect."""
     sample = _sample_from_payload(payload, now)
+    # Record the sample for history; the projection itself needs no history.
     try:
-        conn = db.connect()
-        try:
-            db.ingest(sample, conn)
-            rows_5h = db.recent(
-                _get(config, "forecast", "lookback_5h_seconds", default=3600),
-                now,
-                conn,
-            )
-        finally:
-            conn.close()
+        db.ingest(sample)
     except Exception:
-        rows_5h = []
+        pass
 
-    # 5h window: responsive recent-burn-rate projection from sample history.
-    fc_5h = forecast_window(
-        [(r["ts"], r["used_pct_5h"]) for r in rows_5h], sample.resets_at_5h, now
+    # Both windows project from average pace since the window opened.
+    fc_5h = forecast_from_period_start(
+        sample.used_pct_5h,
+        _get(config, "forecast", "window_5h_seconds", default=18000),
+        sample.resets_at_5h,
+        now,
     )
-    # 7d window: average-pace-since-the-window-opened projection (no history).
     fc_7d = forecast_from_period_start(
         sample.used_pct_7d,
         _get(config, "forecast", "window_7d_seconds", default=604800),
