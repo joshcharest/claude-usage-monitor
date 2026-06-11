@@ -85,7 +85,7 @@ def _window_segment(label: str, fc: WindowForecast, warn_pct: float) -> str:
         return f"{label} {cur}"
     proj = f"proj {fc.projected_pct:.0f}%"
     reset = _fmt_duration(fc.secs_to_reset)
-    return f"{label} {cur}→{proj} {_glyph(fc, warn_pct)} ({reset})"
+    return f"{label} {cur} → {proj} {_glyph(fc, warn_pct)} ({reset})"
 
 
 def render(payload: dict[str, Any], now: float, config: dict[str, Any]) -> str:

@@ -50,7 +50,7 @@ def test_7d_projection_from_period_start(tmp_path, monkeypatch):
         "rate_limits": {"seven_day": {"used_percentage": 30.0, "resets_at": resets}},
     }
     line = statusline.render(payload, now=now, config=config)
-    assert "7d 30%→proj 60%" in line
+    assert "7d 30% → proj 60%" in line
 
 
 def test_missing_rate_limits_degrades(tmp_path, monkeypatch):
