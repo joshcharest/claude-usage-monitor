@@ -5,10 +5,29 @@ Skipped entirely if the `dashboard` extra (pandas) isn't installed.
 
 import pytest
 
-pytest.importorskip("pandas")
+pd = pytest.importorskip("pandas")
+
+from datetime import datetime  # noqa: E402
 
 from claude_usage_monitor.config import load_config  # noqa: E402
 from claude_usage_monitor.dashboard import prep  # noqa: E402
+
+
+def test_to_local_matches_system_wall_clock():
+    epoch = 1_700_000_000.0
+    got = prep.to_local([epoch])[0]
+    # datetime.fromtimestamp (no tz) is local wall-clock; must match to the second.
+    expected = pd.Timestamp(datetime.fromtimestamp(epoch))
+    assert got == expected
+    assert got.tzinfo is None  # naive, so charts render it as local
+
+
+def test_usage_frame_uses_local_time():
+    # A sample at a known epoch should appear at the local wall-clock, not UTC.
+    rows = [{"ts": 1_700_000_000.0, "used_pct_5h": 10.0}]
+    df = prep.usage_frame(rows)
+    expected = pd.Timestamp(datetime.fromtimestamp(1_700_000_000.0))
+    assert df["time"].iloc[0] == expected
 
 
 def test_fmt_duration():

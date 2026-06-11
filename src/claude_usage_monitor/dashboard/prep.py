@@ -10,12 +10,48 @@ pace numbers and thresholds match the statusline exactly.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from ..forecast import forecast_from_period_start
+
+
+def _local_tz():
+    """Best-effort IANA local zone (DST-correct), falling back to the fixed offset."""
+    key = os.environ.get("TZ")
+    if not key:
+        try:
+            link = os.readlink("/etc/localtime")  # .../zoneinfo/Area/City
+            if "zoneinfo/" in link:
+                key = link.split("zoneinfo/", 1)[1]
+        except OSError:
+            key = None
+    if key:
+        try:
+            return ZoneInfo(key)
+        except Exception:
+            pass
+    return datetime.now().astimezone().tzinfo
+
+
+_LOCAL_TZ = _local_tz()
+
+
+def to_local(ts):
+    """Convert epoch seconds to tz-naive LOCAL wall-clock datetimes for display.
+
+    Charts/tables render naive datetimes as-is, so converting UTC epoch to local
+    wall-clock here makes axes and timestamps show computer/local time.
+    """
+    out = pd.to_datetime(ts, unit="s", utc=True)
+    if isinstance(out, pd.Series):
+        return out.dt.tz_convert(_LOCAL_TZ).dt.tz_localize(None)
+    return out.tz_convert(_LOCAL_TZ).tz_localize(None)
 
 # Sidebar time-range options → window length in seconds (None = all history).
 RANGES: dict[str, float | None] = {
@@ -143,7 +179,7 @@ def build_kpis(latest: dict | None, config: dict, now: float) -> list[Kpi]:
 
 
 def _to_dt(rows: list[dict], col: str = "ts"):
-    return pd.to_datetime([r[col] for r in rows], unit="s")
+    return to_local([r[col] for r in rows])
 
 
 def usage_frame(rows: list[dict]) -> pd.DataFrame:
@@ -224,7 +260,7 @@ def pace_stack_frame(
         return pd.DataFrame(columns=_STACK_COLS)
 
     df["conversation"] = df["session_id"].map(lambda s: _label(s, titles))
-    df["time"] = pd.to_datetime(df["ts"], unit="s")
+    df["time"] = to_local(df["ts"])
     # Positive increments only; resets/noise (drops) don't subtract.
     df["delta"] = df["used"].diff().clip(lower=0).fillna(0.0)
     baseline = float(df["used"].iloc[0])
@@ -275,5 +311,5 @@ def conversations_frame(rows: list[dict]) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = None
     df = df[_CONV_COLUMNS].copy()
-    df["started_at"] = pd.to_datetime(df["started_at"], unit="s")
+    df["started_at"] = to_local(df["started_at"])
     return df
