@@ -199,6 +199,14 @@ def test_pace_reset_times_skips_stale_past_snapshots():
     assert resets[0] == pd.Timestamp(datetime.fromtimestamp(105 * H))
 
 
+def test_pace_smooth_buckets_targets_fixed_time():
+    # ~10 min target: window in buckets ~ 600s / bucket size.
+    assert prep.pace_smooth_buckets(100.0) == 6     # 600/100
+    assert prep.pace_smooth_buckets(60.0) == 10     # 600/60
+    assert prep.pace_smooth_buckets(1000.0) == 1    # coarse buckets -> minimal
+    assert prep.pace_smooth_buckets(0) == 1         # guard
+
+
 def test_pace_bucket_seconds():
     assert prep.pace_bucket_seconds(15000, [], target_points=150) == 100.0
     # floor at 30s for tiny ranges

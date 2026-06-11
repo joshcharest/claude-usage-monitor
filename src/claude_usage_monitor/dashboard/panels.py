@@ -55,7 +55,7 @@ def render_pace(controls: Controls, config: dict) -> None:
 
     labels = data.session_labels(data.generation())
     bucket = prep.pace_bucket_seconds(controls.window_seconds, series)
-    smooth = prep.pace_smooth_buckets(series, bucket)  # adaptive rolling-avg window
+    smooth = prep.pace_smooth_buckets(bucket)  # ~10-min rolling-average window
     df = prep.pace_share_frame(series, labels, bucket, smooth_buckets=smooth)
     warn = float(config.get("alerts", {}).get("warn_projected_pct", 90))
 
