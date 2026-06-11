@@ -79,18 +79,17 @@ def render_pace(controls: Controls, config: dict) -> None:
         f"{warn:.0f}% and ceiling 100%.{reset_note}"
     )
 
-    # Total usage (cumulative spend), accumulating by conversation.
-    st.markdown("**Total usage — cumulative spend by conversation**")
-    acc = prep.usage_accumulation_frame(
-        data.usage_rows(controls.window_seconds), labels, bucket
-    )
+    # Total usage: cumulative % of the window budget consumed, by conversation.
+    st.markdown(f"**Total usage — % of {which} budget consumed (out of 100)**")
+    acc = prep.usage_accumulation_frame(series, labels, bucket, reset_times=resets)
     if acc.empty:
-        st.caption("No cost data in this range yet.")
+        st.caption("No usage data in this range yet.")
     else:
         st.altair_chart(_cumulative_usage_chart(acc, resets), use_container_width=True)
         st.caption(
-            "Cumulative cost ($) attributed to each conversation over time; bands "
-            "accumulate (never decrease) and the stack top is total spend."
+            f"High-water mark of the {which} window used % (0–100): how full the "
+            "current window got, accumulating and resetting at each reset, split by "
+            "each conversation's share of activity."
         )
 
 
@@ -100,13 +99,17 @@ def _cumulative_usage_chart(df, resets=None):
         .mark_area()
         .encode(
             x=alt.X("time:T", title=None),
-            y=alt.Y("cost_usd:Q", stack=True, title="cumulative $"),
+            y=alt.Y("used_pct:Q", stack=True, title="% of budget",
+                    scale=alt.Scale(domain=[0, 100])),
             color=alt.Color("conversation:N", legend=alt.Legend(title="conversation")),
             tooltip=["conversation:N",
-                     alt.Tooltip("cost_usd:Q", title="$", format=".2f")],
+                     alt.Tooltip("used_pct:Q", title="% of budget", format=".0f")],
         )
     )
-    layers = [area]
+    ceiling = alt.Chart(pd.DataFrame({"y": [100.0]})).mark_rule(
+        strokeDash=[6, 4], color="#999"
+    ).encode(y="y:Q")
+    layers = [area, ceiling]
     if resets:
         vlines = alt.Chart(pd.DataFrame({"time": list(resets)})).mark_rule(
             color="#e4572e", strokeWidth=2

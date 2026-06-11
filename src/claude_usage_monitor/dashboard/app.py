@@ -25,7 +25,10 @@ st.markdown(
     """
     <style>
       .block-container { padding-top: 1.2rem; padding-bottom: 1rem; }
-      [data-testid="stHeader"] { height: 0; }
+      [data-testid="stHeader"] { display: none; }
+      [data-testid="stToolbar"] { display: none; }
+      [data-testid="stDecoration"] { display: none; }
+      #MainMenu { display: none; }
       [data-testid="stVerticalBlock"] { gap: 0.4rem; }
       [data-testid="stMetric"] { padding: 2px 0; }
       h1, h2, h3 { margin: 0.2rem 0; padding: 0; }

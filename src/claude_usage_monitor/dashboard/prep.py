@@ -10,6 +10,7 @@ pace numbers and thresholds match the statusline exactly.
 
 from __future__ import annotations
 
+import bisect
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -332,32 +333,36 @@ def pace_share_frame(
     )
 
 
-_USAGE_COLS = ["time", "conversation", "cost_usd"]
+_USAGE_COLS = ["time", "conversation", "used_pct"]
 
 
 def usage_accumulation_frame(
-    rows: list[dict],
+    series: list[dict],
     labels: dict[str, str] | None = None,
     bucket_seconds: float | None = None,
+    reset_times=None,
 ) -> pd.DataFrame:
-    """Cumulative spend ($) per conversation over time, for a stacked area.
+    """Cumulative % of the focused window's budget used (0–100), by conversation.
 
-    Unlike pace (a rolling rate), this ACCUMULATES: each sample's ``cost_usd`` is
-    the session's running total, so per bucket we take each session's latest
-    total, carry it forward, and sum by conversation. Stacking gives total spend
-    over time, with each branch's band growing monotonically.
+    Unlike pace (the rolling used %, which rises and falls), this ACCUMULATES: it
+    tracks the high-water mark of used % — how full the current window got —
+    monotonically from 0 toward 100, and resets to the new window at each
+    ``reset_times`` boundary. The high-water total is split across conversations
+    by their cumulative activity share within the current window, so bands
+    accumulate and the stack top is the peak % of budget consumed.
 
-    Returns long-format ``(time, conversation, cost_usd)``.
+    Returns long-format ``(time, conversation, used_pct)``.
     """
-    if not rows:
+    if not series:
         return pd.DataFrame(columns=_USAGE_COLS)
 
     labels = labels or {}
-    df = pd.DataFrame(rows)
-    if "cost_usd" not in df.columns or "session_id" not in df.columns:
+    reset_vals = sorted(pd.Timestamp(t) for t in (reset_times or []))
+    df = pd.DataFrame(series)
+    if "used_pct" not in df.columns or "session_id" not in df.columns:
         return pd.DataFrame(columns=_USAGE_COLS)
-    df["cost_usd"] = pd.to_numeric(df["cost_usd"], errors="coerce")
-    df = df.dropna(subset=["cost_usd"]).sort_values("ts")
+    df["used_pct"] = pd.to_numeric(df["used_pct"], errors="coerce")
+    df = df.dropna(subset=["used_pct"]).sort_values("ts")
     if df.empty:
         return pd.DataFrame(columns=_USAGE_COLS)
 
@@ -367,21 +372,28 @@ def usage_accumulation_frame(
         df["time"].dt.floor(f"{int(bucket_seconds)}s") if bucket_seconds else df["time"]
     )
 
-    branch = dict(zip(df["session_id"], df["conversation"]))
-    # Each session's running-total cost per bucket, carried forward over the axis.
-    per_session = df.pivot_table(
-        index="bucket", columns="session_id", values="cost_usd", aggfunc="last"
-    ).sort_index().ffill().fillna(0.0)
+    peak = df.groupby("bucket")["used_pct"].max().sort_index()
+    buckets = peak.index
+    # Segment id per bucket = number of resets at/before it (window resets break
+    # the high-water mark and the cumulative activity share).
+    seg = pd.Series(
+        [bisect.bisect_right(reset_vals, b) for b in buckets], index=buckets
+    )
+    highwater = peak.groupby(seg).cummax()
 
-    long = per_session.reset_index().melt(
-        id_vars="bucket", var_name="session_id", value_name="cost_usd"
+    counts = (
+        df.groupby(["bucket", "conversation"]).size().unstack(fill_value=0)
+        .reindex(buckets, fill_value=0)
     )
-    long["conversation"] = long["session_id"].map(branch)
-    out = (
-        long.groupby(["bucket", "conversation"])["cost_usd"].sum().reset_index()
-        .rename(columns={"bucket": "time"})
+    cum = counts.groupby(seg).cumsum()
+    share = cum.div(cum.sum(axis=1).replace(0, 1), axis=0)
+    band = share.mul(highwater, axis=0)  # stack sums to the high-water used %
+
+    return (
+        band.reset_index()
+        .melt(id_vars="bucket", var_name="conversation", value_name="used_pct")
+        .rename(columns={"bucket": "time"})[_USAGE_COLS]
     )
-    return out[_USAGE_COLS]
 
 
 def model_frame(rows: list[dict]) -> pd.DataFrame:

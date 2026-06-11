@@ -121,38 +121,34 @@ def test_pace_share_frame_empty():
     assert list(df.columns) == ["time", "conversation", "share"]
 
 
-def test_usage_accumulation_sums_running_totals_by_branch():
-    # Two sessions on two branches; cost_usd is each session's running total.
+def test_usage_accumulation_high_water_mark():
+    # Used % rises then falls; the cumulative chart holds the high-water peak.
     series = [
-        {"ts": 1000.0, "session_id": "s1", "cost_usd": 1.0},
-        {"ts": 1005.0, "session_id": "s2", "cost_usd": 2.0},
-        {"ts": 1010.0, "session_id": "s1", "cost_usd": 3.0},  # s1 grew to 3
+        {"ts": 0.0, "session_id": "s1", "used_pct": 10.0},    # bucket 0, peak 10
+        {"ts": 70.0, "session_id": "s1", "used_pct": 30.0},   # bucket 1, peak 30
+        {"ts": 140.0, "session_id": "s1", "used_pct": 20.0},  # bucket 2, drops to 20
     ]
-    df = prep.usage_accumulation_frame(
-        series, {"s1": "main", "s2": "feat"}, bucket_seconds=60
-    )
-    # Single 60s bucket: latest per session -> s1=3, s2=2; stack total = 5.
-    assert df["cost_usd"].sum() == pytest.approx(5.0)
-    by = dict(zip(df["conversation"], df["cost_usd"]))
-    assert by["main"] == pytest.approx(3.0)
-    assert by["feat"] == pytest.approx(2.0)
-
-
-def test_usage_accumulation_carries_forward_monotonic():
-    # Across buckets, a session's running total carries forward (never drops).
-    series = [
-        {"ts": 0.0, "session_id": "s1", "cost_usd": 5.0},     # bucket 0
-        {"ts": 120.0, "session_id": "s2", "cost_usd": 2.0},   # bucket 2 (s1 absent)
-    ]
-    df = prep.usage_accumulation_frame(series, {}, bucket_seconds=60)
+    df = prep.usage_accumulation_frame(series, {"s1": "main"}, bucket_seconds=60)
     last_t = df["time"].max()
-    # At the last bucket, s1's 5.0 is carried forward and s2's 2.0 adds -> 7.0.
-    assert df[df["time"] == last_t]["cost_usd"].sum() == pytest.approx(7.0)
+    # High-water mark = 30, not the current 20.
+    assert df[df["time"] == last_t]["used_pct"].sum() == pytest.approx(30.0)
+
+
+def test_usage_accumulation_resets_at_window_reset():
+    series = [
+        {"ts": 0.0, "session_id": "s1", "used_pct": 50.0},   # bucket 0
+        {"ts": 70.0, "session_id": "s1", "used_pct": 10.0},  # bucket 1 (after reset)
+    ]
+    reset = prep.to_local([35.0])[0]  # reset between the two buckets
+    df = prep.usage_accumulation_frame(series, {}, bucket_seconds=60, reset_times=[reset])
+    last_t = df["time"].max()
+    # New window after the reset -> high-water restarts at 10, not held at 50.
+    assert df[df["time"] == last_t]["used_pct"].sum() == pytest.approx(10.0)
 
 
 def test_usage_accumulation_empty():
     df = prep.usage_accumulation_frame([])
-    assert list(df.columns) == ["time", "conversation", "cost_usd"]
+    assert list(df.columns) == ["time", "conversation", "used_pct"]
 
 
 def test_pace_share_smoothing_reduces_spikes():
