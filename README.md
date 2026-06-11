@@ -19,7 +19,11 @@ and `rate_limits.seven_day`, each with `used_percentage` and `resets_at`. On
 each tick this tool:
 
 1. **Records** a usage sample to a local SQLite DB at `~/.claude/budget.db`.
-2. **Forecasts** end-of-window usage from the recent burn rate.
+2. **Forecasts** end-of-window usage for each window:
+   - **5h** — recent burn rate from sample history (responsive to bursts).
+   - **7d** — average pace since the window opened (a budget burndown:
+     `projected = used% ÷ fraction_of_window_elapsed`), so it works from a
+     single sample and isn't thrown off by short-term spikes.
 3. **Renders** a compact status line, e.g.:
 
    ```

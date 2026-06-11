@@ -23,7 +23,7 @@ from typing import Any
 
 from . import db
 from .config import load_config
-from .forecast import WindowForecast, forecast_window
+from .forecast import WindowForecast, forecast_from_period_start, forecast_window
 from .policy import recommend
 
 
@@ -100,21 +100,21 @@ def render(payload: dict[str, Any], now: float, config: dict[str, Any]) -> str:
                 now,
                 conn,
             )
-            rows_7d = db.recent(
-                _get(config, "forecast", "lookback_7d_seconds", default=43200),
-                now,
-                conn,
-            )
         finally:
             conn.close()
     except Exception:
-        rows_5h, rows_7d = [], []
+        rows_5h = []
 
+    # 5h window: responsive recent-burn-rate projection from sample history.
     fc_5h = forecast_window(
         [(r["ts"], r["used_pct_5h"]) for r in rows_5h], sample.resets_at_5h, now
     )
-    fc_7d = forecast_window(
-        [(r["ts"], r["used_pct_7d"]) for r in rows_7d], sample.resets_at_7d, now
+    # 7d window: average-pace-since-the-window-opened projection (no history).
+    fc_7d = forecast_from_period_start(
+        sample.used_pct_7d,
+        _get(config, "forecast", "window_7d_seconds", default=604800),
+        sample.resets_at_7d,
+        now,
     )
 
     warn = float(_get(config, "alerts", "warn_projected_pct", default=90.0))

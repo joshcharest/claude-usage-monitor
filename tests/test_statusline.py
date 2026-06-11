@@ -39,6 +39,20 @@ def test_render_survives_empty_payload(tmp_path, monkeypatch):
     assert "5h —" in line
 
 
+def test_7d_projection_from_period_start(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_BUDGET_DB", str(tmp_path / "p.db"))
+    config = load_config()
+    now = 1_000_000.0
+    # Halfway through the 7d window, 30% used -> projects 60%.
+    resets = now + 604800 / 2
+    payload = {
+        "model": {"display_name": "Opus"},
+        "rate_limits": {"seven_day": {"used_percentage": 30.0, "resets_at": resets}},
+    }
+    line = statusline.render(payload, now=now, config=config)
+    assert "7d 30%→proj 60%" in line
+
+
 def test_missing_rate_limits_degrades(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_BUDGET_DB", str(tmp_path / "s.db"))
     config = load_config()

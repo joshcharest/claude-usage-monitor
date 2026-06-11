@@ -12,11 +12,12 @@ warn_projected_pct = 90.0
 critical_used_pct = 95.0
 
 [forecast]
-# Only use samples from the last N seconds when estimating burn rate.
-# 5h window default lookback (seconds): 1 hour of recent history.
+# 5h window uses a responsive recent-burn-rate projection over this lookback
+# of sample history (seconds): 1 hour.
 lookback_5h_seconds = 3600
-# 7d window default lookback (seconds): 12 hours of recent history.
-lookback_7d_seconds = 43200
+# 7d window projects from average pace since the window opened; this is its
+# total length (Anthropic weekly window = 7 days, in seconds).
+window_7d_seconds = 604800
 
 # Phase 2 seam: tiered model/effort recommendation by 7-day window usage.
 # Phase 1 only DISPLAYS the recommendation; it does not act on it.
