@@ -6,8 +6,15 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+# The dashboard is opt-in so the core tool (statusline + indexer) stays
+# zero-runtime-dependency. Install with: uv sync --extra dashboard
+dashboard = ["streamlit>=1.40", "altair>=5", "pandas>=2"]
+
 [project.scripts]
 claude-usage-statusline = "claude_usage_monitor.statusline:main"
+claude-usage-index = "claude_usage_monitor.indexer:main"
+claude-usage-dashboard = "claude_usage_monitor.dashboard.launch:main"
 
 [dependency-groups]
 dev = ["pytest>=8.0"]

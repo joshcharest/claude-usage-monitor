@@ -98,9 +98,38 @@ uv run pytest
 cat tests/sample_payload.json | uv run claude-usage-statusline
 ```
 
+## Dashboard
+
+A graphical dashboard shows six views — **time, pace, usage, models, effort,
+conversations** — combining the live `budget.db` time-series with conversation
+metadata parsed from your Claude Code transcripts.
+
+```bash
+# One-time (and any time after): build/refresh the transcript index.
+uv run claude-usage-index
+
+# Launch the auto-refreshing dashboard (installs the optional extra).
+uv sync --extra dashboard
+uv run --extra dashboard claude-usage-dashboard   # -> http://localhost:8501
+```
+
+How the data is sourced:
+- **Pace / usage / effort / time** come from `~/.claude/budget.db` (the
+  statusline monitor) — so these are sparse until the monitor has been running.
+- **Conversations / models** are parsed from `~/.claude/projects/*/*.jsonl`
+  (full history: titles, durations, message counts, models). Token counts there
+  are unreliable and are never surfaced as cost.
+- **Per-session cost** comes from `statusline-capture.jsonl`, so it only exists
+  for sessions the monitor observed.
+
+The index lives in `~/.claude/usage-index.db` (separate from `budget.db`, never
+committed). Re-indexing is incremental — only changed/new transcripts are
+re-parsed — and the dashboard keeps it warm automatically.
+
 ## Roadmap
 
-- **Phase 1 (this):** monitor + pace forecast + recommendation display.
+- **Phase 1:** monitor + pace forecast + recommendation seam (done).
+- **Dashboard (this):** six-view Streamlit dashboard over the index + budget.db.
 - **Phase 2:** act on the recommendation — a preflight launcher that sets
   model/effort before `claude` starts, and/or a Claude Agent SDK harness for
   fine-grained per-task control.
