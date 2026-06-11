@@ -148,6 +148,18 @@ Claude Code **SessionStart** hook in `~/.claude/settings.json`:
 Override the port or repo location with `CLAUDE_USAGE_DASHBOARD_PORT` /
 `CLAUDE_USAGE_MONITOR_DIR`. Logs go to `~/.claude/usage-dashboard.log`.
 
+### Stopping / status
+
+```bash
+claude-usage-dashboard --status   # is it running?
+claude-usage-dashboard --stop     # graceful stop (SIGTERM, then SIGKILL)
+# or, without the extra installed:
+./scripts/stop-dashboard.sh
+```
+
+Stop targets the detached server only — it excludes the calling shell's own
+process group, so it's safe to run from anywhere.
+
 ## Roadmap
 
 - **Phase 1:** monitor + pace forecast + recommendation seam (done).
