@@ -71,6 +71,12 @@ def connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
     _ensure_columns(conn)
+    # Guard on column presence so this never fails on an ancient DB that predates
+    # the session_id column; current/new DBs always have it.
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(samples)")}
+    if "session_id" in cols:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_samples_session ON samples(session_id)")
+    conn.commit()
     return conn
 
 
