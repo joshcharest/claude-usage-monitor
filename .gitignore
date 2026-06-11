@@ -1,0 +1,16 @@
+# Local usage data and personal config never belong in this public repo
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+budget.local.toml
+statusline-capture.jsonl
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+build/
+*.egg-info/

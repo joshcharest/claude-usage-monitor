@@ -1,0 +1,23 @@
+[project]
+name = "claude-usage-monitor"
+version = "0.1.0"
+description = "Self-monitor Claude Code usage vs paid plan windows; forecast pace; (later) manage model/effort"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+claude-usage-statusline = "claude_usage_monitor.statusline:main"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_usage_monitor"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

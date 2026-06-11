@@ -1,0 +1,36 @@
+# claude-usage-monitor configuration TEMPLATE
+#
+# This file ships in the public repo with placeholder values only.
+# To customize WITHOUT committing personal data, copy it to
+#   ~/.claude/budget.local.toml
+# and edit there. The local override is gitignored and takes precedence.
+
+[alerts]
+# Warn when the forecast projects a window will reach this % before it resets.
+warn_projected_pct = 90.0
+# Treat the window as effectively spent at this observed %.
+critical_used_pct = 95.0
+
+[forecast]
+# Only use samples from the last N seconds when estimating burn rate.
+# 5h window default lookback (seconds): 1 hour of recent history.
+lookback_5h_seconds = 3600
+# 7d window default lookback (seconds): 12 hours of recent history.
+lookback_7d_seconds = 43200
+
+# Phase 2 seam: tiered model/effort recommendation by 7-day window usage.
+# Phase 1 only DISPLAYS the recommendation; it does not act on it.
+[[policy.tiers]]
+max_used_pct = 50.0
+model = "opus"
+effort = "high"
+
+[[policy.tiers]]
+max_used_pct = 80.0
+model = "sonnet"
+effort = "medium"
+
+[[policy.tiers]]
+max_used_pct = 100.0
+model = "haiku"
+effort = "low"
