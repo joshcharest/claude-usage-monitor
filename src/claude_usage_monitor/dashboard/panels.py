@@ -55,32 +55,33 @@ def render_pace(controls: Controls, config: dict) -> None:
 
     labels = data.session_labels(data.generation())
     bucket = prep.pace_bucket_seconds(controls.window_seconds, series)
-    df = prep.pace_active_frame(series, labels, bucket)
+    df = prep.pace_share_frame(series, labels, bucket)
     warn = float(config.get("alerts", {}).get("warn_projected_pct", 90))
 
     if df.empty:
         st.caption("Not enough samples yet.")
         return
 
-    st.altair_chart(_active_pace_chart(df, warn), use_container_width=True)
+    st.altair_chart(_stacked_pace_chart(df, warn), use_container_width=True)
     st.caption(
         f"Actual {which}-window used % over time (a rolling metric — it rises and "
-        f"falls as usage ages out), colored by the conversation most active in each "
-        f"~{int(bucket)}s bucket. Dashed lines: warn {warn:.0f}% and ceiling 100%."
+        f"falls as usage ages out), stacked by conversation in proportion to each "
+        f"one's activity per ~{int(bucket)}s bucket; the stack top is the true "
+        f"used %. Dashed lines: warn {warn:.0f}% and ceiling 100%."
     )
 
 
-def _active_pace_chart(df, warn: float):
+def _stacked_pace_chart(df, warn: float):
     area = (
         alt.Chart(df)
-        .mark_area(opacity=0.85, interpolate="monotone")
+        .mark_area()
         .encode(
             x=alt.X("time:T", title=None),
-            y=alt.Y("used_pct:Q", stack=None, title="used % of window",
+            y=alt.Y("share:Q", stack=True, title="used % of window",
                     scale=alt.Scale(domain=[0, 105])),
             color=alt.Color("conversation:N", legend=alt.Legend(title="conversation")),
             tooltip=["conversation:N",
-                     alt.Tooltip("used_pct:Q", title="used %", format=".0f")],
+                     alt.Tooltip("share:Q", title="share of used %", format=".1f")],
         )
     )
     refs = pd.DataFrame({"y": [warn, 100.0],

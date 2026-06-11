@@ -205,7 +205,7 @@ def cost_frame(rows: list[dict]) -> pd.DataFrame:
                          "cost_usd": [r["cost_usd"] for r in rows]})
 
 
-_PACE_COLS = ["time", "conversation", "used_pct"]
+_PACE_COLS = ["time", "conversation", "share"]
 
 
 def pace_bucket_seconds(
@@ -228,20 +228,21 @@ def _label(session_id, titles: dict[str, str]) -> str:
     return titles.get(session_id) or (str(session_id)[:8] if session_id else "unknown")
 
 
-def pace_active_frame(
+def pace_share_frame(
     series: list[dict],
     labels: dict[str, str] | None = None,
     bucket_seconds: float | None = None,
 ) -> pd.DataFrame:
-    """Actual window used % over time, colored by the active conversation.
+    """Actual window used %, split among the conversations active in each bucket.
 
     ``used_pct`` is an account-wide ROLLING metric (it rises and falls as usage
-    ages out), so it must NOT be cumulatively stacked. We instead plot the real
-    used % and color each time bucket by the conversation that was most active in
-    it. Within a bucket we take the mean used % and the dominant conversation.
+    ages out), so per-conversation increments must NOT be cumulatively summed
+    (that overcounts). Instead, within each time bucket we take the actual mean
+    used % and allocate it across the active conversations in proportion to how
+    many samples each contributed. Stacking these shares makes the stack top
+    equal the true used % — bounded, never an overcount.
 
-    Returns ``(time, conversation, used_pct)`` — the chart height is always the
-    true used %, never an overcount.
+    Returns long-format ``(time, conversation, share)`` for a stacked area.
     """
     if not series:
         return pd.DataFrame(columns=_PACE_COLS)
@@ -257,21 +258,19 @@ def pace_active_frame(
 
     df["conversation"] = df["session_id"].map(lambda s: _label(s, labels))
     df["time"] = to_local(df["ts"])
+    df["bucket"] = (
+        df["time"].dt.floor(f"{int(bucket_seconds)}s") if bucket_seconds else df["time"]
+    )
 
-    if bucket_seconds:
-        df["bucket"] = df["time"].dt.floor(f"{int(bucket_seconds)}s")
-        grouped = df.groupby("bucket")
-        out = pd.DataFrame(
-            {
-                "time": grouped["used_pct"].mean().index,
-                "used_pct": grouped["used_pct"].mean().values,
-                "conversation": grouped["conversation"]
-                .agg(lambda s: s.value_counts().index[0])  # dominant conversation
-                .values,
-            }
-        )
-        return out[_PACE_COLS]
-    return df[_PACE_COLS].reset_index(drop=True)
+    rows = []
+    for bucket_time, group in df.groupby("bucket"):
+        total = float(group["used_pct"].mean())
+        counts = group["conversation"].value_counts()
+        n = int(counts.sum())
+        for conv, c in counts.items():
+            rows.append({"time": bucket_time, "conversation": conv,
+                         "share": total * c / n})
+    return pd.DataFrame(rows, columns=_PACE_COLS)
 
 
 def model_frame(rows: list[dict]) -> pd.DataFrame:

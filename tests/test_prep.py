@@ -89,35 +89,36 @@ def test_usage_frame_long_format():
     assert len(df) == 3  # 2 5h + 1 7d (the None is dropped)
 
 
-def test_pace_active_frame_tracks_actual_not_overcounted():
-    # A rolling, oscillating used_pct: the chart must follow the actual value,
-    # never a cumulative sum of the up-moves.
+def test_pace_share_stack_sums_to_actual_used_not_overcounted():
+    # Rolling, oscillating used_pct in one bucket: the stack top (sum of shares)
+    # must equal the bucket's actual mean used %, never a cumulative overcount.
     series = [
         {"ts": 1000.0, "session_id": "s1", "used_pct": 50.0},
         {"ts": 1001.0, "session_id": "s1", "used_pct": 20.0},  # drops (ages out)
-        {"ts": 1002.0, "session_id": "s1", "used_pct": 55.0},  # rises again
+        {"ts": 1002.0, "session_id": "s1", "used_pct": 56.0},  # rises again
     ]
-    df = prep.pace_active_frame(series, {"s1": "Chat one"})
-    assert df["used_pct"].max() == 55.0  # not 50+35=85 overcount
-    assert set(df["conversation"]) == {"Chat one"}
+    df = prep.pace_share_frame(series, {"s1": "br/one"}, bucket_seconds=60)
+    assert df["share"].sum() == pytest.approx(42.0)  # mean(50,20,56), not 50+36
+    assert set(df["conversation"]) == {"br/one"}
 
 
-def test_pace_active_frame_bucket_dominant_and_mean():
-    # In one 60s bucket, s1 has more samples than s2 -> bucket colored s1.
+def test_pace_share_proportional_allocation():
+    # One 60s bucket, s1 has 2 samples and s2 has 1 -> shares split 2:1 of mean.
     series = [
-        {"ts": 1000.0, "session_id": "s1", "used_pct": 10.0},
-        {"ts": 1005.0, "session_id": "s1", "used_pct": 12.0},
-        {"ts": 1010.0, "session_id": "s2", "used_pct": 14.0},
+        {"ts": 1000.0, "session_id": "s1", "used_pct": 30.0},
+        {"ts": 1005.0, "session_id": "s1", "used_pct": 30.0},
+        {"ts": 1010.0, "session_id": "s2", "used_pct": 30.0},
     ]
-    df = prep.pace_active_frame(series, {"s1": "one"}, bucket_seconds=60)
-    assert len(df) == 1  # one 60s bucket
-    assert df["conversation"].iloc[0] == "one"  # dominant (2 of 3 samples)
-    assert df["used_pct"].iloc[0] == pytest.approx(12.0)  # mean of 10,12,14
+    df = prep.pace_share_frame(series, {"s1": "one", "s2": "two"}, bucket_seconds=60)
+    shares = dict(zip(df["conversation"], df["share"]))
+    assert shares["one"] == pytest.approx(20.0)  # 30 * 2/3
+    assert shares["two"] == pytest.approx(10.0)  # 30 * 1/3
+    assert sum(shares.values()) == pytest.approx(30.0)  # stack top = used %
 
 
-def test_pace_active_frame_empty():
-    df = prep.pace_active_frame([])
-    assert list(df.columns) == ["time", "conversation", "used_pct"]
+def test_pace_share_frame_empty():
+    df = prep.pace_share_frame([])
+    assert list(df.columns) == ["time", "conversation", "share"]
 
 
 def test_pace_bucket_seconds():

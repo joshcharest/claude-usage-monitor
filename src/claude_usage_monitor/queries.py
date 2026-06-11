@@ -254,8 +254,10 @@ def session_labels(*, index_conn=None) -> dict[str, str]:
         rows = index_conn.execute(
             "SELECT session_id, title, git_branch FROM conversations"
         ).fetchall()
+        # Prefer the git branch (matches the user's branch/worktree tab naming),
+        # then the ai-title, then a short session id.
         return {
-            r["session_id"]: (r["title"] or r["git_branch"] or r["session_id"][:8])
+            r["session_id"]: (r["git_branch"] or r["title"] or r["session_id"][:8])
             for r in rows
         }
     finally:
