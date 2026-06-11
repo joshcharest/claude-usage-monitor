@@ -122,7 +122,7 @@ def render(payload: dict[str, Any], now: float, config: dict[str, Any]) -> str:
     parts.append(_window_segment("5h", fc_5h, warn))
     parts.append(_window_segment("7d", fc_7d, warn))
 
-    rec = recommend(fc_7d.current_pct, config)
+    rec = recommend(fc_5h.current_pct, config)
     if rec is not None:
         parts.append(f"→ {rec.model}/{rec.effort}")
 

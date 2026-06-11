@@ -17,7 +17,7 @@ critical_used_pct = 95.0
 window_5h_seconds = 18000
 window_7d_seconds = 604800
 
-# Phase 2 seam: tiered model/effort recommendation by 7-day window usage.
+# Phase 2 seam: tiered model/effort recommendation by 5-hour window usage.
 # Phase 1 only DISPLAYS the recommendation; it does not act on it.
 [[policy.tiers]]
 max_used_pct = 50.0
