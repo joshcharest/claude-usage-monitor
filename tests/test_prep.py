@@ -135,6 +135,28 @@ def test_pace_share_smoothing_reduces_spikes():
     assert smooth["share"].sum() == pytest.approx(raw["share"].sum(), abs=1e-6)
 
 
+def test_pace_reset_times_detects_real_reset_ignores_jitter():
+    H = 3600.0
+    series = [
+        {"ts": 0.0, "reset_at": 14 * H},        # first window, max=14h
+        {"ts": 100.0, "reset_at": 14 * H},       # unchanged
+        {"ts": 200.0, "reset_at": 19 * H},       # +5h advance -> RESET at 14h
+        {"ts": 300.0, "reset_at": 19 * H + 600}, # +10min jitter -> not a reset
+        {"ts": 400.0, "reset_at": 14 * H},       # stale snapshot (< max) -> ignored
+        {"ts": 500.0, "reset_at": 19 * H},       # back to max -> ignored
+    ]
+    resets = prep.pace_reset_times(series, min_advance_seconds=3600)
+    assert len(resets) == 1
+    assert resets[0] == pd.Timestamp(datetime.fromtimestamp(14 * H))
+
+
+def test_pace_reset_times_none():
+    assert prep.pace_reset_times([]) == []
+    # Only jitter, never a real block change.
+    series = [{"ts": 0.0, "reset_at": 100.0}, {"ts": 1.0, "reset_at": 200.0}]
+    assert prep.pace_reset_times(series, min_advance_seconds=3600) == []
+
+
 def test_pace_bucket_seconds():
     assert prep.pace_bucket_seconds(15000, [], target_points=150) == 100.0
     # floor at 30s for tiny ranges

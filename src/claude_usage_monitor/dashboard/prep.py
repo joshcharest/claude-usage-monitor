@@ -236,6 +236,32 @@ def pace_smooth_buckets(
     return max(minimum, min(maximum, round(n_buckets * fraction)))
 
 
+def pace_reset_times(series: list[dict], min_advance_seconds: float = 3600.0):
+    """Local times where the focused window actually reset.
+
+    budget.db interleaves multiple concurrent sessions, each reporting its own
+    (sometimes stale) ``reset_at`` snapshot, so the raw value flaps. A genuine
+    reset is the window's reset time advancing past its running maximum by more
+    than ``min_advance_seconds`` (a new block, not sub-hour jitter); the reset
+    happened at the boundary that was crossed (the old running max).
+    """
+    resets: list[float] = []
+    running_max: float | None = None
+    for row in series:
+        ra = row.get("reset_at")
+        if ra is None:
+            continue
+        if running_max is None:
+            running_max = ra
+        elif ra > running_max + min_advance_seconds:
+            resets.append(running_max)  # boundary crossed = reset moment
+            running_max = ra
+        elif ra > running_max:
+            running_max = ra  # small advance = snapshot jitter, not a reset
+    uniq = sorted(set(resets))
+    return list(to_local(uniq)) if uniq else []
+
+
 def _label(session_id, titles: dict[str, str]) -> str:
     return titles.get(session_id) or (str(session_id)[:8] if session_id else "unknown")
 

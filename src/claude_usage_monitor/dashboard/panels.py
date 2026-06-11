@@ -63,18 +63,24 @@ def render_pace(controls: Controls, config: dict) -> None:
         st.caption("Not enough samples yet.")
         return
 
-    st.altair_chart(_stacked_pace_chart(df, warn), use_container_width=True)
+    resets = prep.pace_reset_times(series)
+    st.altair_chart(_stacked_pace_chart(df, warn, resets), use_container_width=True)
     avg_min = max(1, round(smooth * bucket / 60))
+    reset_note = (
+        f" Red vertical line{'s' if len(resets) != 1 else ''} mark where the "
+        f"{which} window reset."
+        if resets else ""
+    )
     st.caption(
         f"Actual {which}-window used % over time (a rolling metric — it rises and "
         f"falls as usage ages out), stacked by conversation in proportion to each "
         f"one's activity, then a centered ~{avg_min}-minute rolling average; the "
         f"stack top is the true (smoothed) used %. Dashed lines: warn "
-        f"{warn:.0f}% and ceiling 100%."
+        f"{warn:.0f}% and ceiling 100%.{reset_note}"
     )
 
 
-def _stacked_pace_chart(df, warn: float):
+def _stacked_pace_chart(df, warn: float, resets=None):
     area = (
         alt.Chart(df)
         .mark_area()
@@ -95,7 +101,13 @@ def _stacked_pace_chart(df, warn: float):
         .mark_text(align="left", dx=5, dy=-5, color="#999")
         .encode(x=alt.value(5), y="y:Q", text="label:N")
     )
-    return (area + rules + rule_labels).properties(height=360)
+    layers = [area, rules, rule_labels]
+    if resets:
+        vlines = alt.Chart(pd.DataFrame({"time": list(resets)})).mark_rule(
+            color="#e4572e", strokeWidth=2
+        ).encode(x="time:T")
+        layers.append(vlines)
+    return alt.layer(*layers).properties(height=360)
 
 
 def render_usage(controls: Controls, config: dict) -> None:

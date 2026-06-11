@@ -237,6 +237,7 @@ def pace_timeseries(
                 "used_pct": fc.current_pct,
                 "projected_pct": fc.projected_pct,
                 "on_pace": fc.on_pace,
+                "reset_at": row[reset_col],
             }
         )
     return out
