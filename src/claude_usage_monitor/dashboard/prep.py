@@ -232,6 +232,7 @@ def pace_share_frame(
     series: list[dict],
     labels: dict[str, str] | None = None,
     bucket_seconds: float | None = None,
+    smooth_buckets: int = 1,
 ) -> pd.DataFrame:
     """Actual window used %, split among the conversations active in each bucket.
 
@@ -241,6 +242,10 @@ def pace_share_frame(
     used % and allocate it across the active conversations in proportion to how
     many samples each contributed. Stacking these shares makes the stack top
     equal the true used % — bounded, never an overcount.
+
+    ``smooth_buckets`` > 1 applies a centered rolling mean of that many buckets
+    to each conversation's share series, smoothing the spiky rolling metric. The
+    stack top stays the smoothed total used %.
 
     Returns long-format ``(time, conversation, share)`` for a stacked area.
     """
@@ -270,7 +275,19 @@ def pace_share_frame(
         for conv, c in counts.items():
             rows.append({"time": bucket_time, "conversation": conv,
                          "share": total * c / n})
-    return pd.DataFrame(rows, columns=_PACE_COLS)
+    long = pd.DataFrame(rows, columns=_PACE_COLS)
+    if long.empty or smooth_buckets <= 1:
+        return long
+
+    # Smooth each conversation's share across buckets (centered rolling mean).
+    wide = long.pivot_table(
+        index="time", columns="conversation", values="share", aggfunc="sum"
+    ).fillna(0.0)
+    wide = wide.rolling(int(smooth_buckets), center=True, min_periods=1).mean()
+    return (
+        wide.reset_index()
+        .melt(id_vars="time", var_name="conversation", value_name="share")[_PACE_COLS]
+    )
 
 
 def model_frame(rows: list[dict]) -> pd.DataFrame:

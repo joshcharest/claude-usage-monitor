@@ -121,6 +121,20 @@ def test_pace_share_frame_empty():
     assert list(df.columns) == ["time", "conversation", "share"]
 
 
+def test_pace_share_smoothing_reduces_spikes():
+    # One conversation with a single-bucket spike (0,0,90,0,0). A centered
+    # rolling mean spreads the spike, lowering its peak.
+    series = []
+    for i, used in enumerate([0.0, 0.0, 90.0, 0.0, 0.0]):
+        series.append({"ts": 1000.0 + i * 60, "session_id": "s1", "used_pct": used})
+    raw = prep.pace_share_frame(series, {"s1": "br"}, bucket_seconds=60, smooth_buckets=1)
+    smooth = prep.pace_share_frame(series, {"s1": "br"}, bucket_seconds=60, smooth_buckets=3)
+    assert raw["share"].max() == pytest.approx(90.0)
+    assert smooth["share"].max() < 90.0  # spike spread out
+    # total area is conserved within rounding (mean smoothing)
+    assert smooth["share"].sum() == pytest.approx(raw["share"].sum(), abs=1e-6)
+
+
 def test_pace_bucket_seconds():
     assert prep.pace_bucket_seconds(15000, [], target_points=150) == 100.0
     # floor at 30s for tiny ranges
