@@ -55,7 +55,7 @@ def render_pace(controls: Controls, config: dict) -> None:
 
     labels = data.session_labels(data.generation())
     bucket = prep.pace_bucket_seconds(controls.window_seconds, series)
-    smooth = 7  # centered rolling-mean window (buckets) to tame the spiky metric
+    smooth = prep.pace_smooth_buckets(series, bucket)  # adaptive rolling-avg window
     df = prep.pace_share_frame(series, labels, bucket, smooth_buckets=smooth)
     warn = float(config.get("alerts", {}).get("warn_projected_pct", 90))
 
@@ -64,11 +64,12 @@ def render_pace(controls: Controls, config: dict) -> None:
         return
 
     st.altair_chart(_stacked_pace_chart(df, warn), use_container_width=True)
+    avg_min = max(1, round(smooth * bucket / 60))
     st.caption(
         f"Actual {which}-window used % over time (a rolling metric — it rises and "
         f"falls as usage ages out), stacked by conversation in proportion to each "
-        f"one's activity per ~{int(bucket)}s bucket and smoothed over {smooth} "
-        f"buckets; the stack top is the true used %. Dashed lines: warn "
+        f"one's activity, then a centered ~{avg_min}-minute rolling average; the "
+        f"stack top is the true (smoothed) used %. Dashed lines: warn "
         f"{warn:.0f}% and ceiling 100%."
     )
 

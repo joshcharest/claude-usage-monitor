@@ -224,6 +224,18 @@ def pace_bucket_seconds(
     return max(30.0, span / target_points)
 
 
+def pace_smooth_buckets(
+    series: list[dict], bucket_seconds: float, fraction: float = 0.12,
+    minimum: int = 5, maximum: int = 90,
+) -> int:
+    """Adaptive rolling-average window (in buckets) ~``fraction`` of the range."""
+    if not series or len(series) < 2 or not bucket_seconds:
+        return minimum
+    span = series[-1]["ts"] - series[0]["ts"]
+    n_buckets = max(1, int(span / bucket_seconds))
+    return max(minimum, min(maximum, round(n_buckets * fraction)))
+
+
 def _label(session_id, titles: dict[str, str]) -> str:
     return titles.get(session_id) or (str(session_id)[:8] if session_id else "unknown")
 
