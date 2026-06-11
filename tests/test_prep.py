@@ -157,6 +157,18 @@ def test_pace_reset_times_none():
     assert prep.pace_reset_times(series, min_advance_seconds=3600) == []
 
 
+def test_pace_reset_times_skips_stale_past_snapshots():
+    H = 3600.0
+    series = [
+        {"ts": 100 * H, "reset_at": 50 * H},      # stale: reset_at in the past
+        {"ts": 100 * H + 10, "reset_at": 105 * H},  # valid future -> max=105h
+        {"ts": 100 * H + 20, "reset_at": 110 * H},  # +5h -> RESET at 105h
+    ]
+    resets = prep.pace_reset_times(series, min_advance_seconds=3600)
+    assert len(resets) == 1  # the stale 50h is NOT marked
+    assert resets[0] == pd.Timestamp(datetime.fromtimestamp(105 * H))
+
+
 def test_pace_bucket_seconds():
     assert prep.pace_bucket_seconds(15000, [], target_points=150) == 100.0
     # floor at 30s for tiny ranges

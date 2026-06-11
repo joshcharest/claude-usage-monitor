@@ -249,7 +249,9 @@ def pace_reset_times(series: list[dict], min_advance_seconds: float = 3600.0):
     running_max: float | None = None
     for row in series:
         ra = row.get("reset_at")
-        if ra is None:
+        # Skip stale snapshots: a real reset time is in the FUTURE relative to
+        # its sample. Lagging concurrent sessions report past reset_at values.
+        if ra is None or ra <= row.get("ts", ra):
             continue
         if running_max is None:
             running_max = ra
