@@ -70,28 +70,49 @@ def test_usage_frame_long_format():
     assert len(df) == 3  # 2 5h + 1 7d (the None is dropped)
 
 
-def test_pace_conversation_frame_labels_and_raw():
+def test_pace_stack_sums_to_total_used():
+    # Increments attributed to the active conversation; baseline -> (earlier).
     series = [
-        {"ts": 1000.0, "session_id": "s1", "used_pct": 20.0, "projected_pct": 50.0},
-        {"ts": 1001.0, "session_id": "s2", "used_pct": 22.0, "projected_pct": 55.0},
+        {"ts": 1000.0, "session_id": "s1", "used_pct": 10.0},  # baseline 10
+        {"ts": 1001.0, "session_id": "s1", "used_pct": 20.0},  # +10 -> s1
+        {"ts": 1002.0, "session_id": "s2", "used_pct": 35.0},  # +15 -> s2
+        {"ts": 1003.0, "session_id": "s1", "used_pct": 40.0},  # +5  -> s1
     ]
-    df = prep.pace_conversation_frame(series, {"s1": "First chat"})
-    # s1 gets its title; s2 falls back to a short session id.
-    assert set(df["conversation"]) == {"First chat", "s2"}
-    assert list(df.columns) == ["time", "conversation", "used_pct", "projected_pct"]
+    df = prep.pace_stack_frame(series, {"s1": "Chat one"})
+    last_t = df["time"].max()
+    stack_top = df[df["time"] == last_t]["contribution"].sum()
+    assert stack_top == pytest.approx(40.0)  # == final used_pct
+    convs = set(df["conversation"])
+    assert "Chat one" in convs and "s2" in convs
+    assert "(before monitoring)" in convs  # baseline band
 
 
-def test_pace_conversation_frame_smooths_into_buckets():
-    # 6 dense samples 10s apart; 60s buckets (epoch-aligned) collapse them to 2,
-    # each value being the bucket mean — far fewer points than the raw samples.
+def test_pace_stack_ignores_resets():
+    # A drop (window reset / noise) must not subtract from the stack.
     series = [
-        {"ts": 1000.0 + i * 10, "session_id": "s1",
-         "used_pct": 20.0 + i, "projected_pct": 50.0 + i}
+        {"ts": 1000.0, "session_id": "s1", "used_pct": 50.0},
+        {"ts": 1001.0, "session_id": "s1", "used_pct": 30.0},  # drop -> ignored
+        {"ts": 1002.0, "session_id": "s1", "used_pct": 40.0},  # +10 from 30
+    ]
+    df = prep.pace_stack_frame(series, {})
+    last_t = df["time"].max()
+    # baseline 50 + s1's positive increment 10 = 60 (drop ignored).
+    assert df[df["time"] == last_t]["contribution"].sum() == pytest.approx(60.0)
+
+
+def test_pace_stack_smooths_into_buckets():
+    series = [
+        {"ts": 1000.0 + i * 10, "session_id": "s1", "used_pct": 10.0 + i}
         for i in range(6)
     ]
-    df = prep.pace_conversation_frame(series, {}, bucket_seconds=60)
-    assert len(df) < len(series)  # smoothed
-    assert df["used_pct"].iloc[0] == pytest.approx(20.5)  # mean of samples in bucket 1
+    raw = prep.pace_stack_frame(series, {})
+    bucketed = prep.pace_stack_frame(series, {}, bucket_seconds=60)
+    assert bucketed["time"].nunique() < raw["time"].nunique()  # fewer time points
+
+
+def test_pace_stack_empty():
+    df = prep.pace_stack_frame([])
+    assert list(df.columns) == ["time", "conversation", "contribution"]
 
 
 def test_pace_bucket_seconds():
@@ -101,11 +122,6 @@ def test_pace_bucket_seconds():
     # derive span from series when no window given
     series = [{"ts": 0.0}, {"ts": 30000.0}]
     assert prep.pace_bucket_seconds(None, series, target_points=150) == 200.0
-
-
-def test_pace_conversation_frame_empty():
-    df = prep.pace_conversation_frame([])
-    assert list(df.columns) == ["time", "conversation", "used_pct", "projected_pct"]
 
 
 def test_conversations_frame_columns():

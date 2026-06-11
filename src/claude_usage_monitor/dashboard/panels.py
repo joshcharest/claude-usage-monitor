@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import time
 
+import altair as alt
+import pandas as pd
 import streamlit as st
 
 from . import data, prep
@@ -34,10 +36,10 @@ def render_time(controls: Controls, config: dict) -> None:
 
 
 def render_pace(controls: Controls, config: dict) -> None:
-    """Pace over time for the focused window, smoothed and split by conversation."""
+    """Window usage over time, stacked by conversation, with reference lines."""
     which = controls.window_focus
     series = data.pace_rows(which, controls.window_seconds)
-    st.markdown(f"**{which} window — pace by conversation**")
+    st.markdown(f"**{which} window — usage stacked by conversation**")
     if not series:
         st.info("No pace data in this range yet — the live statusline monitor "
                 "needs to record samples first.")
@@ -53,16 +55,43 @@ def render_pace(controls: Controls, config: dict) -> None:
 
     titles = data.session_titles(data.generation())
     bucket = prep.pace_bucket_seconds(controls.window_seconds, series)
-    df = prep.pace_conversation_frame(series, titles, bucket)
+    df = prep.pace_stack_frame(series, titles, bucket)
+    warn = float(config.get("alerts", {}).get("warn_projected_pct", 90))
 
-    warn = config.get("alerts", {}).get("warn_projected_pct", 90)
-    st.caption(f"Budget-burndown projection (used% ÷ fraction of window elapsed), "
-               f"smoothed to ~{int(bucket)}s buckets. Each color is one conversation. "
-               f"Warn {warn}%, ceiling 100%.")
-    st.markdown("**Projected pace**")
-    st.line_chart(df, x="time", y="projected_pct", color="conversation", height=320)
-    st.markdown("**Actual usage**")
-    st.line_chart(df, x="time", y="used_pct", color="conversation", height=240)
+    if df.empty:
+        st.caption("Not enough samples to stack yet.")
+        return
+
+    st.altair_chart(_stacked_pace_chart(df, warn), use_container_width=True)
+    st.caption(
+        f"Each band is one conversation's contribution to the {which} window; the "
+        f"stack top is the total used %. Smoothed to ~{int(bucket)}s buckets. "
+        f"Dashed lines: warn {warn:.0f}% and ceiling 100%."
+    )
+
+
+def _stacked_pace_chart(df, warn: float):
+    area = (
+        alt.Chart(df)
+        .mark_area()
+        .encode(
+            x=alt.X("time:T", title=None),
+            y=alt.Y("contribution:Q", stack=True, title="used % of window",
+                    scale=alt.Scale(domain=[0, 105])),
+            color=alt.Color("conversation:N", legend=alt.Legend(title="conversation")),
+            tooltip=["conversation:N",
+                     alt.Tooltip("contribution:Q", title="share %", format=".1f")],
+        )
+    )
+    refs = pd.DataFrame({"y": [warn, 100.0],
+                         "label": [f"warn {warn:.0f}%", "ceiling 100%"]})
+    rules = alt.Chart(refs).mark_rule(strokeDash=[6, 4], color="#999").encode(y="y:Q")
+    labels = (
+        alt.Chart(refs)
+        .mark_text(align="left", dx=5, dy=-5, color="#999")
+        .encode(x=alt.value(5), y="y:Q", text="label:N")
+    )
+    return (area + rules + labels).properties(height=360)
 
 
 def render_usage(controls: Controls, config: dict) -> None:

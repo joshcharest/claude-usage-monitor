@@ -169,7 +169,8 @@ def cost_frame(rows: list[dict]) -> pd.DataFrame:
                          "cost_usd": [r["cost_usd"] for r in rows]})
 
 
-_PACE_COLS = ["time", "conversation", "used_pct", "projected_pct"]
+_STACK_COLS = ["time", "conversation", "contribution"]
+_EARLIER = "(before monitoring)"
 
 
 def pace_bucket_seconds(
@@ -188,44 +189,63 @@ def pace_bucket_seconds(
     return max(30.0, span / target_points)
 
 
-def pace_conversation_frame(
+def _label(session_id, titles: dict[str, str]) -> str:
+    return titles.get(session_id) or (str(session_id)[:8] if session_id else "unknown")
+
+
+def pace_stack_frame(
     series: list[dict],
     titles: dict[str, str] | None = None,
     bucket_seconds: float | None = None,
 ) -> pd.DataFrame:
-    """Actual + projected used % over time, labeled by conversation and smoothed.
+    """Per-conversation cumulative contribution to window usage, for a stacked area.
 
-    Each row carries the active conversation's title (or a short session id), so
-    the chart can color the pace line per conversation. When ``bucket_seconds``
-    is given, the dense ~300ms samples are resampled (mean) into time buckets
-    per conversation to smooth the line.
+    Each increase in the window's used % between consecutive samples is
+    attributed to the conversation active at that moment. Cumulating those
+    increments per conversation and stacking them makes the top of the stack
+    equal the total used % (the consumption pace). The baseline usage already
+    present at the first sample is attributed to a ``(before monitoring)`` band
+    so the stack still sums to the absolute used %.
+
+    Returns long-format rows ``(time, conversation, contribution)``. When
+    ``bucket_seconds`` is given the cumulative series is resampled (last value
+    per bucket) to smooth and thin the chart.
     """
     if not series:
-        return pd.DataFrame(columns=_PACE_COLS)
+        return pd.DataFrame(columns=_STACK_COLS)
 
     titles = titles or {}
     df = pd.DataFrame(series)
-    for col in ("used_pct", "projected_pct", "session_id"):
-        if col not in df.columns:
-            df[col] = None
-    df[["used_pct", "projected_pct"]] = df[["used_pct", "projected_pct"]].apply(
-        pd.to_numeric, errors="coerce"
-    )
-    df["conversation"] = df["session_id"].map(
-        lambda s: titles.get(s) or (str(s)[:8] if s else "unknown")
-    )
+    if "used_pct" not in df.columns or "session_id" not in df.columns:
+        return pd.DataFrame(columns=_STACK_COLS)
+    df["used"] = pd.to_numeric(df["used_pct"], errors="coerce")
+    df = df.dropna(subset=["used"]).sort_values("ts")
+    if df.empty:
+        return pd.DataFrame(columns=_STACK_COLS)
+
+    df["conversation"] = df["session_id"].map(lambda s: _label(s, titles))
     df["time"] = pd.to_datetime(df["ts"], unit="s")
+    # Positive increments only; resets/noise (drops) don't subtract.
+    df["delta"] = df["used"].diff().clip(lower=0).fillna(0.0)
+    baseline = float(df["used"].iloc[0])
+
+    # Cumulative contribution per conversation over the shared time axis.
+    pivot = df.pivot_table(
+        index="time", columns="conversation", values="delta", aggfunc="sum"
+    ).fillna(0.0)
+    cum = pivot.cumsum()
+    if baseline > 0:
+        cum.insert(0, _EARLIER, baseline)
 
     if bucket_seconds:
-        df = (
-            df.set_index("time")
-            .groupby("conversation")[["used_pct", "projected_pct"]]
-            .resample(f"{int(bucket_seconds)}s")
-            .mean()
-            .reset_index()
-            .dropna(subset=["used_pct", "projected_pct"], how="all")
-        )
-    return df[_PACE_COLS]
+        cum = cum.resample(f"{int(bucket_seconds)}s").last().ffill().dropna(how="all")
+
+    long = (
+        cum.reset_index()
+        .melt(id_vars="time", var_name="conversation", value_name="contribution")
+        .dropna(subset=["contribution"])
+    )
+    return long[_STACK_COLS]
 
 
 def model_frame(rows: list[dict]) -> pd.DataFrame:
