@@ -34,24 +34,35 @@ def render_time(controls: Controls, config: dict) -> None:
 
 
 def render_pace(controls: Controls, config: dict) -> None:
-    """Actual vs projected usage over time for the focused window."""
+    """Pace over time for the focused window, smoothed and split by conversation."""
     which = controls.window_focus
     series = data.pace_rows(which, controls.window_seconds)
-    df = prep.pace_frame(series)
-    st.markdown(f"**{which} window — actual vs projected**")
-    if df.empty:
-        st.info("No pace data in this range yet.")
+    st.markdown(f"**{which} window — pace by conversation**")
+    if not series:
+        st.info("No pace data in this range yet — the live statusline monitor "
+                "needs to record samples first.")
         return
-    st.line_chart(df, x="time", y="pct", color="series", height=320)
+
     last = series[-1]
     c1, c2, c3 = st.columns(3)
     c1.metric("Current", _pct(last.get("used_pct")))
     c2.metric("Projected", _pct(last.get("projected_pct")))
     on_pace = last.get("on_pace")
-    c3.metric("Status", "on pace" if on_pace else ("over budget" if on_pace is False else "—"))
+    c3.metric("Status",
+              "on pace" if on_pace else ("over budget" if on_pace is False else "—"))
+
+    titles = data.session_titles(data.generation())
+    bucket = prep.pace_bucket_seconds(controls.window_seconds, series)
+    df = prep.pace_conversation_frame(series, titles, bucket)
+
     warn = config.get("alerts", {}).get("warn_projected_pct", 90)
-    st.caption(f"Projection = budget burndown (used% ÷ fraction of window elapsed). "
-               f"Warn threshold {warn}%, ceiling 100%.")
+    st.caption(f"Budget-burndown projection (used% ÷ fraction of window elapsed), "
+               f"smoothed to ~{int(bucket)}s buckets. Each color is one conversation. "
+               f"Warn {warn}%, ceiling 100%.")
+    st.markdown("**Projected pace**")
+    st.line_chart(df, x="time", y="projected_pct", color="conversation", height=320)
+    st.markdown("**Actual usage**")
+    st.line_chart(df, x="time", y="used_pct", color="conversation", height=240)
 
 
 def render_usage(controls: Controls, config: dict) -> None:

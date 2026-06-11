@@ -169,18 +169,63 @@ def cost_frame(rows: list[dict]) -> pd.DataFrame:
                          "cost_usd": [r["cost_usd"] for r in rows]})
 
 
-def pace_frame(series: list[dict]) -> pd.DataFrame:
-    """Actual vs projected used % over time (long format)."""
+_PACE_COLS = ["time", "conversation", "used_pct", "projected_pct"]
+
+
+def pace_bucket_seconds(
+    window_seconds: float | None, series: list[dict], target_points: int = 150
+) -> float:
+    """Pick a smoothing bucket size so the chart has ~``target_points`` per series."""
+    if window_seconds:
+        span = window_seconds
+    elif series and len(series) > 1:
+        ts = [s["ts"] for s in series]
+        span = max(ts) - min(ts)
+    else:
+        span = 0.0
+    if span <= 0:
+        return 30.0
+    return max(30.0, span / target_points)
+
+
+def pace_conversation_frame(
+    series: list[dict],
+    titles: dict[str, str] | None = None,
+    bucket_seconds: float | None = None,
+) -> pd.DataFrame:
+    """Actual + projected used % over time, labeled by conversation and smoothed.
+
+    Each row carries the active conversation's title (or a short session id), so
+    the chart can color the pace line per conversation. When ``bucket_seconds``
+    is given, the dense ~300ms samples are resampled (mean) into time buckets
+    per conversation to smooth the line.
+    """
     if not series:
-        return pd.DataFrame(columns=["time", "series", "pct"])
-    dt = pd.to_datetime([s["ts"] for s in series], unit="s")
-    records = []
-    for t, s in zip(dt, series):
-        if s.get("used_pct") is not None:
-            records.append({"time": t, "series": "actual", "pct": s["used_pct"]})
-        if s.get("projected_pct") is not None:
-            records.append({"time": t, "series": "projected", "pct": s["projected_pct"]})
-    return pd.DataFrame(records)
+        return pd.DataFrame(columns=_PACE_COLS)
+
+    titles = titles or {}
+    df = pd.DataFrame(series)
+    for col in ("used_pct", "projected_pct", "session_id"):
+        if col not in df.columns:
+            df[col] = None
+    df[["used_pct", "projected_pct"]] = df[["used_pct", "projected_pct"]].apply(
+        pd.to_numeric, errors="coerce"
+    )
+    df["conversation"] = df["session_id"].map(
+        lambda s: titles.get(s) or (str(s)[:8] if s else "unknown")
+    )
+    df["time"] = pd.to_datetime(df["ts"], unit="s")
+
+    if bucket_seconds:
+        df = (
+            df.set_index("time")
+            .groupby("conversation")[["used_pct", "projected_pct"]]
+            .resample(f"{int(bucket_seconds)}s")
+            .mean()
+            .reset_index()
+            .dropna(subset=["used_pct", "projected_pct"], how="all")
+        )
+    return df[_PACE_COLS]
 
 
 def model_frame(rows: list[dict]) -> pd.DataFrame:

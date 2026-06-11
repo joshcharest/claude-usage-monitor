@@ -42,6 +42,11 @@ def pace_rows(which: str, window_seconds: float | None) -> list[dict]:
     return queries.pace_timeseries(which, window_seconds, now=time.time())
 
 
+@st.cache_data(ttl=60)
+def session_titles(_gen: str) -> dict:
+    return queries.session_titles()
+
+
 @st.cache_data(ttl=30)
 def model_rows(_gen: str, window_seconds: float | None) -> list[dict]:
     since = (time.time() - window_seconds) if window_seconds else None

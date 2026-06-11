@@ -233,12 +233,27 @@ def pace_timeseries(
         out.append(
             {
                 "ts": row["ts"],
+                "session_id": row.get("session_id"),
                 "used_pct": fc.current_pct,
                 "projected_pct": fc.projected_pct,
                 "on_pace": fc.on_pace,
             }
         )
     return out
+
+
+def session_titles(*, index_conn=None) -> dict[str, str]:
+    """Map ``session_id -> title`` from the conversation index (for labeling)."""
+    own = index_conn is None
+    index_conn = index_conn or index_db.connect()
+    try:
+        rows = index_conn.execute(
+            "SELECT session_id, title FROM conversations WHERE title IS NOT NULL"
+        ).fetchall()
+        return {r["session_id"]: r["title"] for r in rows}
+    finally:
+        if own:
+            index_conn.close()
 
 
 # ----------------------------------------------------------------- breakdowns
