@@ -79,6 +79,41 @@ def render_pace(controls: Controls, config: dict) -> None:
         f"{warn:.0f}% and ceiling 100%.{reset_note}"
     )
 
+    # Total usage (cumulative spend), accumulating by conversation.
+    st.markdown("**Total usage — cumulative spend by conversation**")
+    acc = prep.usage_accumulation_frame(
+        data.usage_rows(controls.window_seconds), labels, bucket
+    )
+    if acc.empty:
+        st.caption("No cost data in this range yet.")
+    else:
+        st.altair_chart(_cumulative_usage_chart(acc, resets), use_container_width=True)
+        st.caption(
+            "Cumulative cost ($) attributed to each conversation over time; bands "
+            "accumulate (never decrease) and the stack top is total spend."
+        )
+
+
+def _cumulative_usage_chart(df, resets=None):
+    area = (
+        alt.Chart(df)
+        .mark_area()
+        .encode(
+            x=alt.X("time:T", title=None),
+            y=alt.Y("cost_usd:Q", stack=True, title="cumulative $"),
+            color=alt.Color("conversation:N", legend=alt.Legend(title="conversation")),
+            tooltip=["conversation:N",
+                     alt.Tooltip("cost_usd:Q", title="$", format=".2f")],
+        )
+    )
+    layers = [area]
+    if resets:
+        vlines = alt.Chart(pd.DataFrame({"time": list(resets)})).mark_rule(
+            color="#e4572e", strokeWidth=2
+        ).encode(x="time:T")
+        layers.append(vlines)
+    return alt.layer(*layers).properties(height=280)
+
 
 def _stacked_pace_chart(df, warn: float, resets=None):
     area = (

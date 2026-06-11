@@ -309,7 +309,9 @@ def pace_share_frame(
 
     rows = []
     for bucket_time, group in df.groupby("bucket"):
-        total = float(group["used_pct"].mean())
+        # Use the MAX, not mean: concurrent sessions interleave stale-low
+        # snapshots that drag the average down; the peak is the true reading.
+        total = float(group["used_pct"].max())
         counts = group["conversation"].value_counts()
         n = int(counts.sum())
         for conv, c in counts.items():
@@ -328,6 +330,58 @@ def pace_share_frame(
         wide.reset_index()
         .melt(id_vars="time", var_name="conversation", value_name="share")[_PACE_COLS]
     )
+
+
+_USAGE_COLS = ["time", "conversation", "cost_usd"]
+
+
+def usage_accumulation_frame(
+    rows: list[dict],
+    labels: dict[str, str] | None = None,
+    bucket_seconds: float | None = None,
+) -> pd.DataFrame:
+    """Cumulative spend ($) per conversation over time, for a stacked area.
+
+    Unlike pace (a rolling rate), this ACCUMULATES: each sample's ``cost_usd`` is
+    the session's running total, so per bucket we take each session's latest
+    total, carry it forward, and sum by conversation. Stacking gives total spend
+    over time, with each branch's band growing monotonically.
+
+    Returns long-format ``(time, conversation, cost_usd)``.
+    """
+    if not rows:
+        return pd.DataFrame(columns=_USAGE_COLS)
+
+    labels = labels or {}
+    df = pd.DataFrame(rows)
+    if "cost_usd" not in df.columns or "session_id" not in df.columns:
+        return pd.DataFrame(columns=_USAGE_COLS)
+    df["cost_usd"] = pd.to_numeric(df["cost_usd"], errors="coerce")
+    df = df.dropna(subset=["cost_usd"]).sort_values("ts")
+    if df.empty:
+        return pd.DataFrame(columns=_USAGE_COLS)
+
+    df["conversation"] = df["session_id"].map(lambda s: _label(s, labels))
+    df["time"] = to_local(df["ts"])
+    df["bucket"] = (
+        df["time"].dt.floor(f"{int(bucket_seconds)}s") if bucket_seconds else df["time"]
+    )
+
+    branch = dict(zip(df["session_id"], df["conversation"]))
+    # Each session's running-total cost per bucket, carried forward over the axis.
+    per_session = df.pivot_table(
+        index="bucket", columns="session_id", values="cost_usd", aggfunc="last"
+    ).sort_index().ffill().fillna(0.0)
+
+    long = per_session.reset_index().melt(
+        id_vars="bucket", var_name="session_id", value_name="cost_usd"
+    )
+    long["conversation"] = long["session_id"].map(branch)
+    out = (
+        long.groupby(["bucket", "conversation"])["cost_usd"].sum().reset_index()
+        .rename(columns={"bucket": "time"})
+    )
+    return out[_USAGE_COLS]
 
 
 def model_frame(rows: list[dict]) -> pd.DataFrame:

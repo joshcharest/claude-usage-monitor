@@ -89,16 +89,16 @@ def test_usage_frame_long_format():
     assert len(df) == 3  # 2 5h + 1 7d (the None is dropped)
 
 
-def test_pace_share_stack_sums_to_actual_used_not_overcounted():
-    # Rolling, oscillating used_pct in one bucket: the stack top (sum of shares)
-    # must equal the bucket's actual mean used %, never a cumulative overcount.
+def test_pace_share_stack_uses_peak_not_overcounted_or_diluted():
+    # One bucket: stack top = the PEAK used % (not a cumulative overcount, and
+    # not the mean which stale-low interleaved snapshots would deflate).
     series = [
         {"ts": 1000.0, "session_id": "s1", "used_pct": 50.0},
-        {"ts": 1001.0, "session_id": "s1", "used_pct": 20.0},  # drops (ages out)
-        {"ts": 1002.0, "session_id": "s1", "used_pct": 56.0},  # rises again
+        {"ts": 1001.0, "session_id": "s1", "used_pct": 20.0},  # stale-low snapshot
+        {"ts": 1002.0, "session_id": "s1", "used_pct": 56.0},  # true current
     ]
     df = prep.pace_share_frame(series, {"s1": "br/one"}, bucket_seconds=60)
-    assert df["share"].sum() == pytest.approx(42.0)  # mean(50,20,56), not 50+36
+    assert df["share"].sum() == pytest.approx(56.0)  # peak, not 42 (mean) or 126
     assert set(df["conversation"]) == {"br/one"}
 
 
@@ -119,6 +119,40 @@ def test_pace_share_proportional_allocation():
 def test_pace_share_frame_empty():
     df = prep.pace_share_frame([])
     assert list(df.columns) == ["time", "conversation", "share"]
+
+
+def test_usage_accumulation_sums_running_totals_by_branch():
+    # Two sessions on two branches; cost_usd is each session's running total.
+    series = [
+        {"ts": 1000.0, "session_id": "s1", "cost_usd": 1.0},
+        {"ts": 1005.0, "session_id": "s2", "cost_usd": 2.0},
+        {"ts": 1010.0, "session_id": "s1", "cost_usd": 3.0},  # s1 grew to 3
+    ]
+    df = prep.usage_accumulation_frame(
+        series, {"s1": "main", "s2": "feat"}, bucket_seconds=60
+    )
+    # Single 60s bucket: latest per session -> s1=3, s2=2; stack total = 5.
+    assert df["cost_usd"].sum() == pytest.approx(5.0)
+    by = dict(zip(df["conversation"], df["cost_usd"]))
+    assert by["main"] == pytest.approx(3.0)
+    assert by["feat"] == pytest.approx(2.0)
+
+
+def test_usage_accumulation_carries_forward_monotonic():
+    # Across buckets, a session's running total carries forward (never drops).
+    series = [
+        {"ts": 0.0, "session_id": "s1", "cost_usd": 5.0},     # bucket 0
+        {"ts": 120.0, "session_id": "s2", "cost_usd": 2.0},   # bucket 2 (s1 absent)
+    ]
+    df = prep.usage_accumulation_frame(series, {}, bucket_seconds=60)
+    last_t = df["time"].max()
+    # At the last bucket, s1's 5.0 is carried forward and s2's 2.0 adds -> 7.0.
+    assert df[df["time"] == last_t]["cost_usd"].sum() == pytest.approx(7.0)
+
+
+def test_usage_accumulation_empty():
+    df = prep.usage_accumulation_frame([])
+    assert list(df.columns) == ["time", "conversation", "cost_usd"]
 
 
 def test_pace_share_smoothing_reduces_spikes():
