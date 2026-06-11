@@ -24,7 +24,6 @@ from typing import Any
 from . import db
 from .config import load_config
 from .forecast import WindowForecast, forecast_from_period_start
-from .policy import recommend
 
 
 def _get(d: Any, *path: str, default: Any = None) -> Any:
@@ -121,10 +120,6 @@ def render(payload: dict[str, Any], now: float, config: dict[str, Any]) -> str:
         parts.append(f"ctx {sample.ctx_used_pct:.0f}%")
     parts.append(_window_segment("5h", fc_5h, warn))
     parts.append(_window_segment("7d", fc_7d, warn))
-
-    rec = recommend(fc_5h.current_pct, config)
-    if rec is not None:
-        parts.append(f"→ {rec.model}/{rec.effort}")
 
     return "  ·  ".join(parts)
 
