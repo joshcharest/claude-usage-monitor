@@ -19,20 +19,121 @@ from claude_usage_monitor.dashboard import data, kpi, panels, prep
 
 st.set_page_config(page_title="Claude Usage Monitor", layout="wide")
 
-# Reclaim the large default top padding and tighten vertical spacing so the
-# whole dashboard fits on screen without scrolling.
+# ---------------------------------------------------------------------------
+# "modern-soft" design system — injected CSS.
+#
+# Design tokens (kept in sync with the Altair theme in panels.py):
+#   accent           #6366f1  (indigo-500)  — primary actions / focus
+#   accent-soft      rgba(99,102,241,.16)   — hover / selected tint
+#   surface          rgba(255,255,255,.04)  — card / chip background (dark)
+#   surface-hover    rgba(255,255,255,.07)
+#   border-soft      rgba(255,255,255,.09)  — hairline card borders
+#   text-strong      #e6e8ef                — values / headings
+#   text-muted       #9aa1b1                — labels / captions
+#   radius           14px (cards) / 10px (chips) / 8px (controls)
+#   shadow           0 1px 2px rgba(0,0,0,.25), 0 4px 16px rgba(0,0,0,.18)
+#
+# The hidden-toolbar / tight-top rules are deliberate and preserved.
+# ---------------------------------------------------------------------------
 st.markdown(
     """
     <style>
-      .block-container { padding-top: 1.2rem; padding-bottom: 1rem; }
+      :root {
+        --km-accent: #6366f1;
+        --km-accent-soft: rgba(99, 102, 241, 0.16);
+        --km-surface: rgba(255, 255, 255, 0.04);
+        --km-surface-hover: rgba(255, 255, 255, 0.07);
+        --km-border: rgba(255, 255, 255, 0.09);
+        --km-text-strong: #e6e8ef;
+        --km-text-muted: #9aa1b1;
+        --km-radius-card: 14px;
+        --km-radius-chip: 10px;
+        --km-shadow: 0 1px 2px rgba(0, 0, 0, 0.25), 0 4px 16px rgba(0, 0, 0, 0.18);
+      }
+
+      /* Reclaim default top padding; hide chrome (deliberate). */
+      .block-container { padding-top: 1.1rem; padding-bottom: 1.4rem; max-width: 1500px; }
       [data-testid="stHeader"] { display: none; }
       [data-testid="stToolbar"] { display: none; }
       [data-testid="stDecoration"] { display: none; }
       #MainMenu { display: none; }
-      [data-testid="stVerticalBlock"] { gap: 0.4rem; }
-      [data-testid="stMetric"] { padding: 2px 0; }
+
+      /* Friendly type: comfortable headings, muted captions. */
+      h1, h2, h3, h4 { letter-spacing: -0.01em; }
       h1, h2, h3 { margin: 0.2rem 0; padding: 0; }
-      .stCaption, [data-testid="stCaptionContainer"] { margin-top: -0.3rem; }
+      .stCaption, [data-testid="stCaptionContainer"] {
+        color: var(--km-text-muted); line-height: 1.45;
+      }
+
+      /* Page title: anchor the top of the page with a touch more weight. */
+      .km-title h2 {
+        margin: 0.1rem 0 0.5rem 0;
+        font-weight: 700;
+        font-size: 1.5rem;
+        color: var(--km-text-strong);
+      }
+
+      /* Default vertical rhythm is tight; tabs get breathing room (below). */
+      [data-testid="stVerticalBlock"] { gap: 0.45rem; }
+      .stTabs [data-testid="stVerticalBlock"] { gap: 0.8rem; }
+
+      /* ---- KPI chips: subtle soft cards ---------------------------------- */
+      [data-testid="stMetric"] {
+        background: var(--km-surface);
+        border: 1px solid var(--km-border);
+        border-radius: var(--km-radius-chip);
+        padding: 12px 16px;
+        box-shadow: var(--km-shadow);
+        transition: background 120ms ease, transform 120ms ease;
+      }
+      [data-testid="stMetric"]:hover {
+        background: var(--km-surface-hover);
+        transform: translateY(-1px);
+      }
+      [data-testid="stMetricLabel"] { opacity: 0.85; }
+      [data-testid="stMetricLabel"] p { color: var(--km-text-muted); font-weight: 500; }
+      [data-testid="stMetricValue"] { color: var(--km-text-strong); font-weight: 650; }
+
+      /* In-tab context KPIs (e.g. the Pace Current/Projected/Status row) get an
+         accent left-rail so the eye ties them to the chart that follows. */
+      .stTabs [data-testid="stMetric"] {
+        border-left: 3px solid var(--km-accent);
+        border-radius: 8px var(--km-radius-chip) var(--km-radius-chip) 8px;
+      }
+
+      /* ---- Tabs: pill-style, rounded, accent on the active tab ----------- */
+      .stTabs [data-baseweb="tab-list"] {
+        gap: 4px;
+        border-bottom: 1px solid var(--km-border);
+        padding-bottom: 2px;
+      }
+      .stTabs [data-baseweb="tab"] {
+        border-radius: 9px 9px 0 0;
+        padding: 6px 14px;
+        color: var(--km-text-muted);
+      }
+      .stTabs [data-baseweb="tab"]:hover { background: var(--km-surface); }
+      .stTabs [aria-selected="true"] { color: var(--km-text-strong); }
+
+      /* ---- Charts / dataframes: soft framing ---------------------------- */
+      [data-testid="stVegaLiteChart"], .stDataFrame, [data-testid="stTable"] {
+        border-radius: var(--km-radius-card);
+      }
+
+      /* ---- Sidebar polish ------------------------------------------------ */
+      [data-testid="stSidebar"] { border-right: 1px solid var(--km-border); }
+      [data-testid="stSidebar"] .stCaption { line-height: 1.55; }
+
+      /* Buttons / toggles pick up the accent for a cohesive product feel. */
+      .stButton > button {
+        border-radius: 9px;
+        border: 1px solid var(--km-border);
+        transition: border-color 120ms ease, background 120ms ease;
+      }
+      .stButton > button:hover {
+        border-color: var(--km-accent);
+        background: var(--km-accent-soft);
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -60,17 +161,22 @@ def _sidebar(config: dict) -> prep.Controls:
     last_str = (
         f"{prep.fmt_duration(time.time() - last)} ago" if last else "never"
     )
-    st.sidebar.caption(
-        f"{status.get('conversations', 0)} conversations · {status.get('files', 0)} "
-        f"files indexed · last {last_str}"
-    )
     latest = data.latest_sample()
     if latest:
-        age = prep.fmt_duration(time.time() - latest["ts"])
-        st.sidebar.caption(f"Latest sample {age} ago")
+        sample_line = (
+            f"Latest sample {prep.fmt_duration(time.time() - latest['ts'])} ago"
+        )
     else:
-        st.sidebar.caption("No live samples yet — wire up the statusline monitor.")
-    st.sidebar.caption(f"DB: {db_path()}")
+        sample_line = "No live samples yet — wire up the statusline monitor."
+
+    st.sidebar.divider()
+    st.sidebar.markdown("###### Status")
+    st.sidebar.caption(
+        f"{status.get('conversations', 0)} conversations · {status.get('files', 0)} "
+        f"files indexed · last {last_str}\n\n{sample_line}"
+    )
+    with st.sidebar.expander("DB path"):
+        st.caption(f"`{db_path()}`")
 
     return prep.Controls(
         range_label=range_label,
@@ -92,7 +198,10 @@ def main_render() -> None:
     controls = _sidebar(config)
     refresh = "5s" if controls.live else None
 
-    st.markdown("### Claude Usage Monitor")
+    st.markdown(
+        '<div class="km-title"><h2>Claude Usage Monitor</h2></div>',
+        unsafe_allow_html=True,
+    )
 
     @st.fragment(run_every=refresh)
     def _kpi_row():

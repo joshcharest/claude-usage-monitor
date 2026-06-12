@@ -80,7 +80,9 @@ class Kpi:
     label: str
     value: str
     delta: str | None = None
-    delta_color: str = "normal"  # "normal" | "inverse" | "off"
+    # "normal" | "inverse" | "off", or an explicit named color that st.metric
+    # applies unconditionally: "red" | "orange" | "green" (Streamlit >=1.58).
+    delta_color: str = "normal"
     help: str | None = None
 
 
@@ -149,10 +151,14 @@ def build_kpis(latest: dict | None, config: dict, now: float) -> list[Kpi]:
         return f"{v:.0f}%" if v is not None else "—"
 
     def proj_delta(fc):
+        # st.metric only color-maps "normal"/"inverse" when it can parse a +/-
+        # sign from the delta string; these status strings have none, so we use
+        # the explicit named colors (Streamlit >=1.58) which apply uncondition-
+        # ally. Trending up = caution (orange); trending down/flat = green.
         if fc.projected_pct is None or fc.current_pct is None:
             return None, "off"
-        sign = fc.projected_pct - fc.current_pct
-        return f"proj {fc.projected_pct:.0f}%", ("inverse" if sign >= 0 else "normal")
+        trending_up = fc.projected_pct >= fc.current_pct
+        return f"proj {fc.projected_pct:.0f}%", ("orange" if trending_up else "green")
 
     d5, c5 = proj_delta(fc5)
     d7, c7 = proj_delta(fc7)
@@ -169,7 +175,7 @@ def build_kpis(latest: dict | None, config: dict, now: float) -> list[Kpi]:
             f"resets in {fmt_duration(fc7.secs_to_reset)}"),
         Kpi("Projected 5h", pct(fc5.projected_pct),
             "over budget" if over else "on pace",
-            "inverse" if over else "normal"),
+            "red" if over else "green"),
         Kpi("Session $", f"${cost:.2f}" if isinstance(cost, (int, float)) else "—"),
         Kpi("Active", active, f"5h resets in {reset5}"),
     ]
