@@ -11,6 +11,34 @@ warn_projected_pct = 90.0
 # Treat the window as effectively spent at this observed %.
 critical_used_pct = 95.0
 
+# --- Active alerting (alerts.py) ---------------------------------------------
+# Master switch for the whole alert engine (detection + delivery). When false,
+# no markers and no notifications.
+enabled = true
+# Fire desktop notify-send notifications. The statusline marker is independent
+# and still shows when a condition holds even if this is false (marker-only mode,
+# good for headless/SSH sessions where notify-send would no-op anyway).
+notify = true
+# "Projected WAY over": fire when the budget-burndown forecast projects the
+# current FRESH reading to land at/above this %, AND the projection is meaningful
+# (past the early-window guard, on_pace != None).
+alert_over_pct = 125.0
+# "Spiking rapidly": fire when FRESH used% climbs faster than this many
+# percentage-points per minute over the trailing spike window.
+spike_pp_per_min = 5.0
+# Trailing window (seconds) over which the spike slope is measured.
+spike_window_seconds = 600.0
+# Dedupe bucket (seconds): per bucket keep MAX used% to collapse the ~6-session
+# interleave before fitting the slope.
+spike_bucket_seconds = 30.0
+# Minimum distinct fresh buckets required before a spike can fire (anti-noise).
+spike_min_points = 4
+# Cooldown (seconds): re-notify the same condition at most once per this interval.
+cooldown_seconds = 1800.0
+# Hysteresis: stay latched (marker shown) until the metric falls below
+# threshold * clear_factor, so it doesn't flap at the boundary.
+clear_factor = 0.9
+
 [forecast]
 # Each window projects from average pace since it opened (budget burndown).
 # These are the total window lengths in seconds (Anthropic: 5h and 7d).

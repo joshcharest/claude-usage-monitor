@@ -22,7 +22,7 @@ import time
 from datetime import datetime
 from typing import Any
 
-from . import db
+from . import alerts, db, queries
 from .config import load_config
 from .forecast import WindowForecast, forecast_from_period_start
 
@@ -103,6 +103,25 @@ def _window_segment(label: str, fc: WindowForecast, warn_pct: float, now: float)
     return f"{label} {cur} → {proj} {_glyph(fc, warn_pct)} ({reset})"
 
 
+def _evaluate_alerts(now: float, config: dict[str, Any]) -> list[str]:
+    """Evaluate usage alerts for this tick and return statusline markers.
+
+    Reads recent FRESH samples + the synthesized current reading, runs the pure
+    detection engine, fires any due desktop notifications (cooldown-gated), and
+    persists alert state. Fully wrapped: any failure degrades to no markers so the
+    statusline never breaks.
+    """
+    try:
+        win_s = float(alerts._cfg(config, "spike_window_seconds"))
+        # Pull a little extra history so the trailing-slope window is fully covered.
+        samples = queries.usage_timeseries(win_s * 1.5, now=now)
+        current = queries.current_reading()
+        state = alerts.run_tick(samples, current, config, now)
+        return state.markers()
+    except Exception:
+        return []
+
+
 def render(payload: dict[str, Any], now: float, config: dict[str, Any]) -> str:
     """Build the status line, recording a sample as a side effect."""
     sample = _sample_from_payload(payload, now)
@@ -137,7 +156,15 @@ def render(payload: dict[str, Any], now: float, config: dict[str, Any]) -> str:
     parts.append(_window_segment("5h", fc_5h, warn, now))
     parts.append(_window_segment("7d", fc_7d, warn, now))
 
-    return "  ·  ".join(parts)
+    line = "  ·  ".join(parts)
+
+    # Evaluate alerts AFTER ingesting this tick's sample so the current reading is
+    # included; prepend any markers. Never lets an alert failure break the line.
+    markers = _evaluate_alerts(now, config)
+    if markers:
+        line = "  ".join(markers) + "  ·  " + line
+
+    return line
 
 
 def main() -> int:
