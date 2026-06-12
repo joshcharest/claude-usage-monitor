@@ -10,7 +10,6 @@ pace numbers and thresholds match the statusline exactly.
 
 from __future__ import annotations
 
-import bisect
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -270,60 +269,107 @@ def _label(session_id, titles: dict[str, str]) -> str:
     return titles.get(session_id) or (str(session_id)[:8] if session_id else "unknown")
 
 
+def _bucketed(
+    series: list[dict], labels: dict[str, str] | None, bucket_seconds: float | None
+) -> pd.DataFrame:
+    """Per-sample df (conversation, time, bucket, cost_usd) with STALE rows dropped.
+
+    Drops snapshots whose ``reset_at`` is already in the past relative to the
+    sample's own ``ts`` (same predicate as :func:`pace_reset_times`). Lagging or
+    frozen concurrent sessions report stale account-wide values that would
+    otherwise dominate the per-bucket ``max``. Returns an empty df if nothing
+    usable remains.
+    """
+    if not series:
+        return pd.DataFrame()
+    labels = labels or {}
+    df = pd.DataFrame(series)
+    if "used_pct" not in df.columns or "session_id" not in df.columns:
+        return pd.DataFrame()
+    df["used_pct"] = pd.to_numeric(df["used_pct"], errors="coerce")
+    df = df.dropna(subset=["used_pct"]).sort_values("ts")
+    if "reset_at" in df.columns and "ts" in df.columns:
+        df = df[df["reset_at"].isna() | (df["reset_at"] > df["ts"])]
+    if df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    df["conversation"] = df["session_id"].map(lambda s: _label(s, labels))
+    df["time"] = to_local(df["ts"])
+    df["bucket"] = (
+        df["time"].dt.floor(f"{int(bucket_seconds)}s") if bucket_seconds else df["time"]
+    )
+    df["cost_usd"] = (
+        pd.to_numeric(df["cost_usd"], errors="coerce")
+        if "cost_usd" in df.columns else float("nan")
+    )
+    return df
+
+
+def _cost_weights(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-(bucket, conversation) weight in [0,1], summing to 1 per bucket.
+
+    Weighted by the $ SPENT in each bucket: ``cost_usd`` is a session running
+    total, so per session we take the last value per bucket, forward-fill, and
+    take the positive diff, then aggregate by conversation. Buckets with no spend
+    fall back to an EQUAL split among the conversations present. Returns a wide
+    frame indexed by bucket, columns = conversation.
+    """
+    buckets = sorted(df["bucket"].unique())
+    convs = sorted(df["conversation"].unique())
+    spend = pd.DataFrame(0.0, index=buckets, columns=convs)
+    sess_to_conv = dict(zip(df["session_id"], df["conversation"]))
+    sess_last = df.groupby(["session_id", "bucket"])["cost_usd"].last()
+    for sid, s in sess_last.groupby(level=0):
+        vals = s.droplevel(0).reindex(buckets).ffill()
+        delta = vals.diff().clip(lower=0).fillna(0.0)
+        conv = sess_to_conv.get(sid)
+        if conv in spend.columns:
+            spend[conv] = spend[conv].add(delta, fill_value=0.0)
+
+    present = (
+        df.groupby(["bucket", "conversation"]).size().unstack(fill_value=0)
+        .reindex(index=buckets, columns=convs, fill_value=0).gt(0).astype(float)
+    )
+    total = spend.sum(axis=1)
+    by_cost = spend.div(total.where(total > 0), axis=0)
+    pres_n = present.sum(axis=1)
+    equal = present.div(pres_n.where(pres_n > 0, 1), axis=0)
+    # cost split where there was spend; equal split otherwise
+    return by_cost.where(total.gt(0), equal)
+
+
 def pace_share_frame(
     series: list[dict],
     labels: dict[str, str] | None = None,
     bucket_seconds: float | None = None,
     smooth_buckets: int = 1,
 ) -> pd.DataFrame:
-    """Actual window used %, split among the conversations active in each bucket.
+    """Account-wide window used % over time, split by conversation, for a stack.
 
-    ``used_pct`` is an account-wide ROLLING metric (it rises and falls as usage
-    ages out), so per-conversation increments must NOT be cumulatively summed
-    (that overcounts). Instead, within each time bucket we take the actual mean
-    used % and allocate it across the active conversations in proportion to how
-    many samples each contributed. Stacking these shares makes the stack top
-    equal the true used % — bounded, never an overcount.
+    ``used_pct`` is an account-wide ROLLING metric (rises and falls as usage ages
+    out), reported by several concurrent sessions including stale ones. Per bucket
+    we take the MAX over FRESH samples (stale dropped in :func:`_bucketed`) = the
+    true reading, then split it across conversations weighted by the $ each spent
+    in that bucket (:func:`_cost_weights`). Stacking sums to the true used %.
 
-    ``smooth_buckets`` > 1 applies a centered rolling mean of that many buckets
-    to each conversation's share series, smoothing the spiky rolling metric. The
-    stack top stays the smoothed total used %.
-
-    Returns long-format ``(time, conversation, share)`` for a stacked area.
+    ``smooth_buckets`` > 1 applies a centered rolling mean per conversation.
+    Returns long-format ``(time, conversation, share)``.
     """
-    if not series:
-        return pd.DataFrame(columns=_PACE_COLS)
-
-    labels = labels or {}
-    df = pd.DataFrame(series)
-    if "used_pct" not in df.columns or "session_id" not in df.columns:
-        return pd.DataFrame(columns=_PACE_COLS)
-    df["used_pct"] = pd.to_numeric(df["used_pct"], errors="coerce")
-    df = df.dropna(subset=["used_pct"]).sort_values("ts")
+    df = _bucketed(series, labels, bucket_seconds)
     if df.empty:
         return pd.DataFrame(columns=_PACE_COLS)
 
-    df["conversation"] = df["session_id"].map(lambda s: _label(s, labels))
-    df["time"] = to_local(df["ts"])
-    df["bucket"] = (
-        df["time"].dt.floor(f"{int(bucket_seconds)}s") if bucket_seconds else df["time"]
+    peak = df.groupby("bucket")["used_pct"].max().sort_index()
+    weights = _cost_weights(df).reindex(peak.index).fillna(0.0)
+    band = weights.mul(peak, axis=0)  # bucket × conversation, sums to peak
+    long = (
+        band.reset_index().melt(id_vars="bucket", var_name="conversation",
+                                value_name="share")
+        .rename(columns={"bucket": "time"})[_PACE_COLS]
     )
-
-    rows = []
-    for bucket_time, group in df.groupby("bucket"):
-        # Use the MAX, not mean: concurrent sessions interleave stale-low
-        # snapshots that drag the average down; the peak is the true reading.
-        total = float(group["used_pct"].max())
-        counts = group["conversation"].value_counts()
-        n = int(counts.sum())
-        for conv, c in counts.items():
-            rows.append({"time": bucket_time, "conversation": conv,
-                         "share": total * c / n})
-    long = pd.DataFrame(rows, columns=_PACE_COLS)
     if long.empty or smooth_buckets <= 1:
         return long
 
-    # Smooth each conversation's share across buckets (centered rolling mean).
     wide = long.pivot_table(
         index="time", columns="conversation", values="share", aggfunc="sum"
     ).fillna(0.0)
@@ -342,59 +388,40 @@ def usage_accumulation_frame(
     labels: dict[str, str] | None = None,
     bucket_seconds: float | None = None,
     reset_times=None,
+    current_window_only: bool = False,
+    window_seconds: float | None = None,
 ) -> pd.DataFrame:
-    """Cumulative % of the focused window's budget used (0–100), by conversation.
+    """Current rolling fill of the focused window (0–100 %), split by conversation.
 
-    Unlike pace (the rolling used %, which rises and falls), this ACCUMULATES: it
-    tracks the high-water mark of used % — how full the current window got —
-    monotonically from 0 toward 100, and resets to the new window at each
-    ``reset_times`` boundary. The high-water total is split across conversations
-    by their cumulative activity share within the current window, so bands
-    accumulate and the stack top is the peak % of budget consumed.
-
-    Returns long-format ``(time, conversation, used_pct)``.
+    Same peak-of-fresh + cost-weighted split as :func:`pace_share_frame`, but the
+    value is the window's actual rolling fill (it rises AND falls — no high-water
+    latch). ``current_window_only`` clips to the current window: buckets at/after
+    the most recent ``reset_times`` boundary, or the last ``window_seconds`` if no
+    reset was detected. Returns long-format ``(time, conversation, used_pct)``.
     """
-    if not series:
-        return pd.DataFrame(columns=_USAGE_COLS)
-
-    labels = labels or {}
-    reset_vals = sorted(pd.Timestamp(t) for t in (reset_times or []))
-    df = pd.DataFrame(series)
-    if "used_pct" not in df.columns or "session_id" not in df.columns:
-        return pd.DataFrame(columns=_USAGE_COLS)
-    df["used_pct"] = pd.to_numeric(df["used_pct"], errors="coerce")
-    df = df.dropna(subset=["used_pct"]).sort_values("ts")
+    df = _bucketed(series, labels, bucket_seconds)
     if df.empty:
         return pd.DataFrame(columns=_USAGE_COLS)
 
-    df["conversation"] = df["session_id"].map(lambda s: _label(s, labels))
-    df["time"] = to_local(df["ts"])
-    df["bucket"] = (
-        df["time"].dt.floor(f"{int(bucket_seconds)}s") if bucket_seconds else df["time"]
-    )
-
     peak = df.groupby("bucket")["used_pct"].max().sort_index()
-    buckets = peak.index
-    # Segment id per bucket = number of resets at/before it (window resets break
-    # the high-water mark and the cumulative activity share).
-    seg = pd.Series(
-        [bisect.bisect_right(reset_vals, b) for b in buckets], index=buckets
-    )
-    highwater = peak.groupby(seg).cummax()
-
-    counts = (
-        df.groupby(["bucket", "conversation"]).size().unstack(fill_value=0)
-        .reindex(buckets, fill_value=0)
-    )
-    cum = counts.groupby(seg).cumsum()
-    share = cum.div(cum.sum(axis=1).replace(0, 1), axis=0)
-    band = share.mul(highwater, axis=0)  # stack sums to the high-water used %
-
-    return (
-        band.reset_index()
-        .melt(id_vars="bucket", var_name="conversation", value_name="used_pct")
+    weights = _cost_weights(df).reindex(peak.index).fillna(0.0)
+    band = weights.mul(peak, axis=0)
+    long = (
+        band.reset_index().melt(id_vars="bucket", var_name="conversation",
+                                value_name="used_pct")
         .rename(columns={"bucket": "time"})[_USAGE_COLS]
     )
+
+    if current_window_only and not long.empty:
+        reset_vals = sorted(pd.Timestamp(t) for t in (reset_times or []))
+        cutoff = None
+        if reset_vals:
+            cutoff = reset_vals[-1]
+        elif window_seconds:
+            cutoff = long["time"].max() - pd.Timedelta(seconds=float(window_seconds))
+        if cutoff is not None:
+            long = long[long["time"] >= cutoff]
+    return long[_USAGE_COLS]
 
 
 def model_frame(rows: list[dict]) -> pd.DataFrame:

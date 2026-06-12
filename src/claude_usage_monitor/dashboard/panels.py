@@ -79,17 +79,20 @@ def render_pace(controls: Controls, config: dict) -> None:
         f"{warn:.0f}% and ceiling 100%.{reset_note}"
     )
 
-    # Total usage: cumulative % of the window budget consumed, by conversation.
-    st.markdown(f"**Total usage — % of {which} budget consumed (out of 100)**")
-    acc = prep.usage_accumulation_frame(series, labels, bucket, reset_times=resets)
+    # Total usage: % of the CURRENT window's budget consumed (resets to 0 at each
+    # window boundary) — only the latest window is shown, split by conversation.
+    st.markdown(f"**Total usage — % of {which} budget consumed**")
+    acc = prep.usage_accumulation_frame(
+        series, labels, bucket, reset_times=resets, current_window_only=True
+    )
     if acc.empty:
         st.caption("No usage data in this range yet.")
     else:
-        st.altair_chart(_cumulative_usage_chart(acc, resets), use_container_width=True)
+        st.altair_chart(_cumulative_usage_chart(acc), use_container_width=True)
         st.caption(
-            f"High-water mark of the {which} window used % (0–100): how full the "
-            "current window got, accumulating and resetting at each reset, split by "
-            "each conversation's share of activity."
+            f"% of the current {which} window's budget consumed (0–100): how full "
+            "the current window has gotten since its last reset, split by each "
+            "conversation's share of activity. Resets to 0 at each window boundary."
         )
 
 

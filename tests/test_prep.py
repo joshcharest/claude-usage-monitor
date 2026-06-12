@@ -102,18 +102,44 @@ def test_pace_share_stack_uses_peak_not_overcounted_or_diluted():
     assert set(df["conversation"]) == {"br/one"}
 
 
-def test_pace_share_proportional_allocation():
-    # One 60s bucket, s1 has 2 samples and s2 has 1 -> shares split 2:1 of mean.
+def test_pace_share_cost_weighted():
+    # One bucket's used% is split by $ spent: s1 +$3, s2 +$1 -> 3:1 of 40%.
+    series = [
+        {"ts": 0.0, "session_id": "s1", "used_pct": 40.0, "cost_usd": 10.0},
+        {"ts": 1.0, "session_id": "s2", "used_pct": 40.0, "cost_usd": 20.0},
+        {"ts": 70.0, "session_id": "s1", "used_pct": 40.0, "cost_usd": 13.0},  # +3
+        {"ts": 71.0, "session_id": "s2", "used_pct": 40.0, "cost_usd": 21.0},  # +1
+    ]
+    df = prep.pace_share_frame(series, {"s1": "a", "s2": "b"}, bucket_seconds=60)
+    last = df[df["time"] == df["time"].max()]
+    shares = dict(zip(last["conversation"], last["share"]))
+    assert shares["a"] == pytest.approx(30.0)  # 40 * 3/4
+    assert shares["b"] == pytest.approx(10.0)  # 40 * 1/4
+
+
+def test_pace_share_equal_split_without_cost():
+    # No cost movement -> fall back to an equal split (not poll-count).
     series = [
         {"ts": 1000.0, "session_id": "s1", "used_pct": 30.0},
-        {"ts": 1005.0, "session_id": "s1", "used_pct": 30.0},
+        {"ts": 1005.0, "session_id": "s1", "used_pct": 30.0},  # s1 polled twice
         {"ts": 1010.0, "session_id": "s2", "used_pct": 30.0},
     ]
-    df = prep.pace_share_frame(series, {"s1": "one", "s2": "two"}, bucket_seconds=60)
+    df = prep.pace_share_frame(series, {"s1": "a", "s2": "b"}, bucket_seconds=60)
     shares = dict(zip(df["conversation"], df["share"]))
-    assert shares["one"] == pytest.approx(20.0)  # 30 * 2/3
-    assert shares["two"] == pytest.approx(10.0)  # 30 * 1/3
-    assert sum(shares.values()) == pytest.approx(30.0)  # stack top = used %
+    assert shares["a"] == pytest.approx(15.0)  # equal, NOT 20 (2/3 by count)
+    assert shares["b"] == pytest.approx(15.0)
+
+
+def test_pace_share_drops_stale_high_zombie():
+    # A frozen session reporting used%=53 with a reset_at in the PAST must be
+    # dropped before the max — the stack reflects the fresh 5%, not 53%.
+    series = [
+        {"ts": 1000.0, "session_id": "z", "used_pct": 53.0, "reset_at": 100.0},
+        {"ts": 1001.0, "session_id": "s1", "used_pct": 5.0, "reset_at": 5000.0},
+    ]
+    df = prep.pace_share_frame(series, {"z": "zombie", "s1": "live"}, bucket_seconds=60)
+    assert df["share"].sum() == pytest.approx(5.0)  # not 53
+    assert "zombie" not in set(df["conversation"])
 
 
 def test_pace_share_frame_empty():
@@ -121,17 +147,26 @@ def test_pace_share_frame_empty():
     assert list(df.columns) == ["time", "conversation", "share"]
 
 
-def test_usage_accumulation_high_water_mark():
-    # Used % rises then falls; the cumulative chart holds the high-water peak.
+def test_usage_accumulation_rolling_fill_no_latch():
+    # Used % rises then falls; the chart tracks the actual rolling fill (no
+    # high-water latch), so the last bucket shows 20, not a held 30.
     series = [
-        {"ts": 0.0, "session_id": "s1", "used_pct": 10.0},    # bucket 0, peak 10
-        {"ts": 70.0, "session_id": "s1", "used_pct": 30.0},   # bucket 1, peak 30
-        {"ts": 140.0, "session_id": "s1", "used_pct": 20.0},  # bucket 2, drops to 20
+        {"ts": 0.0, "session_id": "s1", "used_pct": 10.0},
+        {"ts": 70.0, "session_id": "s1", "used_pct": 30.0},
+        {"ts": 140.0, "session_id": "s1", "used_pct": 20.0},  # drops back
     ]
     df = prep.usage_accumulation_frame(series, {"s1": "main"}, bucket_seconds=60)
     last_t = df["time"].max()
-    # High-water mark = 30, not the current 20.
-    assert df[df["time"] == last_t]["used_pct"].sum() == pytest.approx(30.0)
+    assert df[df["time"] == last_t]["used_pct"].sum() == pytest.approx(20.0)
+
+
+def test_usage_accumulation_drops_stale_high():
+    series = [
+        {"ts": 1000.0, "session_id": "z", "used_pct": 67.0, "reset_at": 100.0},  # stale
+        {"ts": 1001.0, "session_id": "s1", "used_pct": 4.0, "reset_at": 5000.0},  # fresh
+    ]
+    df = prep.usage_accumulation_frame(series, {}, bucket_seconds=60)
+    assert df["used_pct"].sum() == pytest.approx(4.0)  # not 67
 
 
 def test_usage_accumulation_resets_at_window_reset():
@@ -144,6 +179,21 @@ def test_usage_accumulation_resets_at_window_reset():
     last_t = df["time"].max()
     # New window after the reset -> high-water restarts at 10, not held at 50.
     assert df[df["time"] == last_t]["used_pct"].sum() == pytest.approx(10.0)
+
+
+def test_usage_accumulation_current_window_only():
+    # Two windows in range; current_window_only keeps just the latest segment.
+    series = [
+        {"ts": 0.0, "session_id": "s1", "used_pct": 50.0},   # bucket 0, pre-reset
+        {"ts": 70.0, "session_id": "s1", "used_pct": 10.0},  # bucket 1, current window
+    ]
+    reset = prep.to_local([35.0])[0]
+    df = prep.usage_accumulation_frame(
+        series, {}, bucket_seconds=60, reset_times=[reset], current_window_only=True
+    )
+    # Only the current (post-reset) window is shown — the pre-reset bucket is dropped.
+    assert df["time"].nunique() == 1
+    assert df["used_pct"].sum() == pytest.approx(10.0)
 
 
 def test_usage_accumulation_empty():
