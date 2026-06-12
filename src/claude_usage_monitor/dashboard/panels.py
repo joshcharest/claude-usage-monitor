@@ -61,8 +61,15 @@ def render_pace(controls: Controls, config: dict) -> None:
     c3.metric("Status",
               "on pace" if on_pace else ("over budget" if on_pace is False else "—"))
 
+    # Keep branch labels fresh during live refresh (throttled to ~15s).
+    try:
+        data.refresh_index()
+    except Exception:
+        pass
     labels = data.session_labels(data.generation())
-    bucket = prep.pace_bucket_seconds(controls.window_seconds, series)
+    color_domain = sorted(set(labels.values())) or None
+    win_len = prep.window_length(config, which)
+    bucket = prep.pace_bucket_seconds(win_len, series)  # size to the focused window
     smooth = prep.pace_smooth_buckets(bucket)  # ~10-min rolling-average window
     df = prep.pace_share_frame(series, labels, bucket, smooth_buckets=smooth)
     warn = float(config.get("alerts", {}).get("warn_projected_pct", 90))
@@ -72,49 +79,58 @@ def render_pace(controls: Controls, config: dict) -> None:
         return
 
     resets = prep.pace_reset_times(series)
-    st.altair_chart(_stacked_pace_chart(df, warn, resets), use_container_width=True)
+    st.altair_chart(_stacked_pace_chart(df, warn, resets, color_domain),
+                    use_container_width=True)
     avg_min = max(1, round(smooth * bucket / 60))
     reset_note = (
-        f" Red vertical line{'s' if len(resets) != 1 else ''} mark where the "
-        f"{which} window reset."
-        if resets else ""
+        f" Red line{'s' if len(resets) != 1 else ''} mark where the {which} "
+        f"window reset." if resets else ""
     )
     st.caption(
-        f"Actual {which}-window used % over time (a rolling metric — it rises and "
-        f"falls as usage ages out), stacked by conversation in proportion to each "
-        f"one's activity, then a centered ~{avg_min}-minute rolling average; the "
-        f"stack top is the true (smoothed) used %. Dashed lines: warn "
-        f"{warn:.0f}% and ceiling 100%.{reset_note}"
+        f"Account-wide {which}-window used % over time (a rolling metric — it rises "
+        f"and falls as usage ages out), peak per ~{int(bucket)}s bucket then a "
+        f"centered ~{avg_min}-min rolling average. Bands split the used % by the $ "
+        f"each conversation spent (a proxy — the % itself is account-wide). Dashed "
+        f"lines: warn {warn:.0f}% and ceiling 100%.{reset_note}"
     )
 
-    # Total usage: % of the CURRENT window's budget consumed (resets to 0 at each
-    # window boundary) — only the latest window is shown, split by conversation.
-    st.markdown(f"**Total usage — % of {which} budget consumed**")
+    # Total usage: the current window's rolling fill (0–100 %), reset-scoped.
+    st.markdown(f"**Total usage — current {which} window fill (%)**")
     acc = prep.usage_accumulation_frame(
-        series, labels, bucket, reset_times=resets, current_window_only=True
+        series, labels, bucket, reset_times=resets,
+        current_window_only=True, window_seconds=win_len,
     )
     if acc.empty:
         st.caption("No usage data in this range yet.")
     else:
-        st.altair_chart(_cumulative_usage_chart(acc), use_container_width=True)
+        st.altair_chart(_cumulative_usage_chart(acc, resets, color_domain),
+                        use_container_width=True)
         st.caption(
-            f"% of the current {which} window's budget consumed (0–100): how full "
-            "the current window has gotten since its last reset, split by each "
-            "conversation's share of activity. Resets to 0 at each window boundary."
+            f"Current {which} window's fill level (0–100 %): the rolling used % "
+            "since its last reset (rises and falls), split by $ spent per "
+            "conversation. The red line marks the window reset."
         )
 
 
-def _cumulative_usage_chart(df, resets=None):
+def _conv_color(color_domain):
+    legend = alt.Legend(title="conversation")
+    if color_domain:
+        return alt.Color("conversation:N", legend=legend,
+                         scale=alt.Scale(domain=color_domain))
+    return alt.Color("conversation:N", legend=legend)
+
+
+def _cumulative_usage_chart(df, resets=None, color_domain=None):
     area = (
         alt.Chart(df)
         .mark_area()
         .encode(
             x=alt.X("time:T", title=None),
-            y=alt.Y("used_pct:Q", stack=True, title="% of budget",
+            y=alt.Y("used_pct:Q", stack=True, title="% of window",
                     scale=alt.Scale(domain=[0, 100])),
-            color=alt.Color("conversation:N", legend=alt.Legend(title="conversation")),
+            color=_conv_color(color_domain),
             tooltip=["conversation:N",
-                     alt.Tooltip("used_pct:Q", title="% of budget", format=".0f")],
+                     alt.Tooltip("used_pct:Q", title="% of window", format=".0f")],
         )
     )
     ceiling = alt.Chart(pd.DataFrame({"y": [100.0]})).mark_rule(
@@ -129,7 +145,7 @@ def _cumulative_usage_chart(df, resets=None):
     return alt.layer(*layers).properties(height=200)
 
 
-def _stacked_pace_chart(df, warn: float, resets=None):
+def _stacked_pace_chart(df, warn: float, resets=None, color_domain=None):
     area = (
         alt.Chart(df)
         .mark_area()
@@ -137,9 +153,10 @@ def _stacked_pace_chart(df, warn: float, resets=None):
             x=alt.X("time:T", title=None),
             y=alt.Y("share:Q", stack=True, title="used % of window",
                     scale=alt.Scale(domain=[0, 105])),
-            color=alt.Color("conversation:N", legend=alt.Legend(title="conversation")),
+            color=_conv_color(color_domain),
             tooltip=["conversation:N",
-                     alt.Tooltip("share:Q", title="share of used %", format=".1f")],
+                     alt.Tooltip("share:Q", title="$-weighted share of used %",
+                                 format=".1f")],
         )
     )
     refs = pd.DataFrame({"y": [warn, 100.0],
