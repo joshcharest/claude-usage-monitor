@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import time
 
@@ -67,7 +68,6 @@ def render_pace(controls: Controls, config: dict) -> None:
     except Exception:
         pass
     labels = data.session_labels(data.generation())
-    color_domain = sorted(set(labels.values())) or None
     win_len = prep.window_length(config, which)
     bucket = prep.pace_bucket_seconds(win_len, series)  # size to the focused window
     smooth = prep.pace_smooth_buckets(bucket)  # ~10-min rolling-average window
@@ -79,8 +79,7 @@ def render_pace(controls: Controls, config: dict) -> None:
         return
 
     resets = prep.pace_reset_times(series)
-    st.altair_chart(_stacked_pace_chart(df, warn, resets, color_domain),
-                    use_container_width=True)
+    st.altair_chart(_stacked_pace_chart(df, warn, resets), use_container_width=True)
     avg_min = max(1, round(smooth * bucket / 60))
     reset_note = (
         f" Red line{'s' if len(resets) != 1 else ''} mark where the {which} "
@@ -103,8 +102,7 @@ def render_pace(controls: Controls, config: dict) -> None:
     if acc.empty:
         st.caption("No usage data in this range yet.")
     else:
-        st.altair_chart(_cumulative_usage_chart(acc, resets, color_domain),
-                        use_container_width=True)
+        st.altair_chart(_cumulative_usage_chart(acc, resets), use_container_width=True)
         st.caption(
             f"Current {which} window's fill level (0–100 %): the rolling used % "
             "since its last reset (rises and falls), split by $ spent per "
@@ -112,15 +110,35 @@ def render_pace(controls: Controls, config: dict) -> None:
         )
 
 
-def _conv_color(color_domain):
+# A fixed categorical palette (Vega "tableau20"); each conversation maps to a
+# slot by a hash of its name, so colors are stable per branch across refreshes
+# without listing every known conversation in the legend.
+_PALETTE = [
+    "#4c78a8", "#9ecae9", "#f58518", "#ffbf79", "#54a24b", "#88d27a", "#b79a20",
+    "#f2cf5b", "#439894", "#83bcb6", "#e45756", "#ff9d98", "#79706e", "#bab0ac",
+    "#d67195", "#fcbfd2", "#b279a2", "#d6a5c9", "#9e765f", "#d8b5a5",
+]
+
+
+def _color_for(name: str) -> str:
+    idx = int(hashlib.md5(str(name).encode()).hexdigest(), 16) % len(_PALETTE)
+    return _PALETTE[idx]
+
+
+def _conv_color(df):
+    """Color encoding whose legend lists only the conversations PRESENT in df,
+    each with a deterministic (hash-based) color that's stable across refreshes."""
     legend = alt.Legend(title="conversation")
-    if color_domain:
-        return alt.Color("conversation:N", legend=legend,
-                         scale=alt.Scale(domain=color_domain))
-    return alt.Color("conversation:N", legend=legend)
+    present = sorted(df["conversation"].dropna().unique()) if "conversation" in df else []
+    if not present:
+        return alt.Color("conversation:N", legend=legend)
+    return alt.Color(
+        "conversation:N", legend=legend,
+        scale=alt.Scale(domain=present, range=[_color_for(c) for c in present]),
+    )
 
 
-def _cumulative_usage_chart(df, resets=None, color_domain=None):
+def _cumulative_usage_chart(df, resets=None):
     area = (
         alt.Chart(df)
         .mark_area()
@@ -128,7 +146,7 @@ def _cumulative_usage_chart(df, resets=None, color_domain=None):
             x=alt.X("time:T", title=None),
             y=alt.Y("used_pct:Q", stack=True, title="% of window",
                     scale=alt.Scale(domain=[0, 100])),
-            color=_conv_color(color_domain),
+            color=_conv_color(df),
             tooltip=["conversation:N",
                      alt.Tooltip("used_pct:Q", title="% of window", format=".0f")],
         )
@@ -145,7 +163,7 @@ def _cumulative_usage_chart(df, resets=None, color_domain=None):
     return alt.layer(*layers).properties(height=200)
 
 
-def _stacked_pace_chart(df, warn: float, resets=None, color_domain=None):
+def _stacked_pace_chart(df, warn: float, resets=None):
     area = (
         alt.Chart(df)
         .mark_area()
@@ -153,7 +171,7 @@ def _stacked_pace_chart(df, warn: float, resets=None, color_domain=None):
             x=alt.X("time:T", title=None),
             y=alt.Y("share:Q", stack=True, title="used % of window",
                     scale=alt.Scale(domain=[0, 105])),
-            color=_conv_color(color_domain),
+            color=_conv_color(df),
             tooltip=["conversation:N",
                      alt.Tooltip("share:Q", title="$-weighted share of used %",
                                  format=".1f")],
