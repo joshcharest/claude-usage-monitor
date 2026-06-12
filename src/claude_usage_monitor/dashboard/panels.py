@@ -12,7 +12,31 @@ import streamlit as st
 
 from . import data, prep
 from .prep import Controls
+from .. import alerts, queries
 from ..forecast import forecast_from_period_start
+
+
+def _render_alert_banner(config: dict, now: float) -> None:
+    """Visualize active usage alerts at the top of the Pace tab.
+
+    Read-only: uses the PURE detection (``alerts.evaluate``), so the dashboard
+    never fires desktop notifications or perturbs the statusline's cooldown
+    state — the statusline owns delivery, the dashboard only shows what's active.
+    Best-effort; never breaks the page.
+    """
+    try:
+        win_s = float(alerts._cfg(config, "spike_window_seconds"))
+        samples = queries.usage_timeseries(win_s * 1.5, now=now)
+        state = alerts.evaluate(samples, queries.current_reading(), config, now, prior={})
+        for wa in state.windows.values():
+            if wa.over and wa.projected_pct is not None:
+                st.error(f"🚨 **{wa.window}** window projected to **{wa.projected_pct:.0f}%** "
+                         "before reset — well over budget.")
+            if wa.spiking and wa.slope_pp_per_min is not None:
+                st.warning(f"🚨 **{wa.window}** usage spiking **+{wa.slope_pp_per_min:.1f} "
+                           f"pp/min** (fresh samples, last {win_s / 60:.0f} min).")
+    except Exception:
+        pass
 
 # ----------------------------------------------------------------- chart theme
 # "modern-soft" dark Altair theme. Registered once at import; every chart in this
@@ -77,6 +101,7 @@ def render_time(controls: Controls, config: dict) -> None:
 def render_pace(controls: Controls, config: dict) -> None:
     """Window usage over time, stacked by conversation, with reference lines."""
     which = controls.window_focus
+    _render_alert_banner(config, time.time())
     series = data.pace_rows(which, controls.window_seconds)
     st.subheader(f"{which} window — usage stacked by conversation")
     if not series:
