@@ -27,17 +27,23 @@ def refresh_index() -> dict:
             "seen": result.files_seen}
 
 
-@st.cache_data(ttl=4)
+@st.cache_data(ttl=6)
 def latest_sample() -> dict | None:
     return queries.latest_sample()
 
 
-@st.cache_data(ttl=4)
+@st.cache_data(ttl=6)
+def current_reading() -> dict | None:
+    """Canonical current usage (max-of-fresh), used by all KPIs so they agree."""
+    return queries.current_reading()
+
+
+@st.cache_data(ttl=6)
 def usage_rows(window_seconds: float | None) -> list[dict]:
     return queries.usage_timeseries(window_seconds, now=time.time())
 
 
-@st.cache_data(ttl=4)
+@st.cache_data(ttl=6)
 def pace_rows(which: str, window_seconds: float | None) -> list[dict]:
     return queries.pace_timeseries(which, window_seconds, now=time.time())
 

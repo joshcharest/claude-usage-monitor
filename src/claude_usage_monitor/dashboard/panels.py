@@ -10,6 +10,7 @@ import streamlit as st
 
 from . import data, prep
 from .prep import Controls
+from ..forecast import forecast_from_period_start
 
 
 def render_time(controls: Controls, config: dict) -> None:
@@ -45,11 +46,17 @@ def render_pace(controls: Controls, config: dict) -> None:
                 "needs to record samples first.")
         return
 
-    last = series[-1]
+    # Derive the KPIs from the canonical current reading (max-of-fresh) and a
+    # live projection, so they agree with the chart top instead of reading one
+    # arbitrary interleaved sample.
+    reading = data.current_reading() or {}
+    fc = forecast_from_period_start(
+        reading.get(f"used_pct_{which}"), prep.window_length(config, which),
+        reading.get(f"resets_at_{which}"), time.time())
     c1, c2, c3 = st.columns(3)
-    c1.metric("Current", _pct(last.get("used_pct")))
-    c2.metric("Projected", _pct(last.get("projected_pct")))
-    on_pace = last.get("on_pace")
+    c1.metric("Current", _pct(fc.current_pct))
+    c2.metric("Projected (worst-case)", _pct(fc.projected_pct))
+    on_pace = fc.on_pace
     c3.metric("Status",
               "on pace" if on_pace else ("over budget" if on_pace is False else "—"))
 

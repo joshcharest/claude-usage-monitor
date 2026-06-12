@@ -171,6 +171,58 @@ def latest_sample(*, budget_conn=None) -> dict[str, Any] | None:
             conn.close()
 
 
+def current_reading(
+    *, recent_seconds: float = 30.0, budget_conn=None
+) -> dict[str, Any] | None:
+    """A single canonical 'current usage' reading, robust to interleaving.
+
+    budget.db interleaves concurrent sessions; a single ``ORDER BY ts DESC`` row
+    is a lottery (and may be a stale 'zombie'). Instead, over the most recent
+    ``recent_seconds`` of samples, take the MAX used % among FRESH rows
+    (``resets_at_* > ts``) for each window, with that row's reset time, plus the
+    latest cost/model/effort. This matches the charts' per-bucket max-of-fresh,
+    so the KPIs agree with the chart. Falls back to the latest row if no fresh
+    rows exist.
+    """
+    conn, own = _open_budget(budget_conn)
+    if conn is None:
+        return None
+    try:
+        max_ts_row = conn.execute("SELECT MAX(ts) AS m FROM samples").fetchone()
+        if not max_ts_row or max_ts_row["m"] is None:
+            return None
+        cutoff = max_ts_row["m"] - recent_seconds
+        rows = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM samples WHERE ts >= ? ORDER BY ts ASC", (cutoff,)
+            )
+        ]
+        if not rows:
+            return None
+
+        out = dict(rows[-1])  # latest row seeds cost/model/effort/ts/session_id
+        for used_col, reset_col in (
+            ("used_pct_5h", "resets_at_5h"),
+            ("used_pct_7d", "resets_at_7d"),
+        ):
+            fresh = [
+                r for r in rows
+                if r.get(used_col) is not None
+                and r.get(reset_col) is not None
+                and r[reset_col] > r["ts"]
+            ]
+            if fresh:
+                best = max(fresh, key=lambda r: r[used_col])
+                out[used_col] = best[used_col]
+                out[reset_col] = best[reset_col]
+            # else: leave the latest row's values (graceful fallback)
+        return out
+    finally:
+        if own:
+            conn.close()
+
+
 def session_timeseries(session_id: str, *, budget_conn=None) -> list[dict[str, Any]]:
     conn, own = _open_budget(budget_conn)
     if conn is None:

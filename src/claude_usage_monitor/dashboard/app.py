@@ -96,7 +96,7 @@ def main_render() -> None:
 
     @st.fragment(run_every=refresh)
     def _kpi_row():
-        kpi.render_kpis(prep.build_kpis(data.latest_sample(), config, time.time()))
+        kpi.render_kpis(prep.build_kpis(data.current_reading(), config, time.time()))
 
     _kpi_row()
 

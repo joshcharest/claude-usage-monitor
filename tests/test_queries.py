@@ -26,6 +26,30 @@ def _add_conversation(session_id, title="t", repo=None, started=1000.0, models="
     conn.close()
 
 
+def test_current_reading_uses_fresh_max_not_zombie(env):
+    now = 1_000_000.0
+    # Frozen "zombie": high used %, but its window already reset (stale).
+    db.ingest(Sample(ts=now, session_id="z", used_pct_5h=53.0,
+                     resets_at_5h=int(now - 1000), used_pct_7d=53.0,
+                     resets_at_7d=int(now - 1000), cost_usd=1.0))
+    # Fresh low reading.
+    db.ingest(Sample(ts=now + 1, session_id="s1", used_pct_5h=5.0,
+                     resets_at_5h=int(now + 9000), used_pct_7d=8.0,
+                     resets_at_7d=int(now + 200000), cost_usd=2.0, model="opus"))
+    r = queries.current_reading(recent_seconds=60)
+    assert r["used_pct_5h"] == 5.0  # fresh max, not the stale 53
+    assert r["used_pct_7d"] == 8.0
+    assert r["resets_at_5h"] == int(now + 9000)
+
+
+def test_current_reading_falls_back_to_latest_when_all_stale(env):
+    now = 1_000_000.0
+    db.ingest(Sample(ts=now, session_id="z", used_pct_5h=40.0,
+                     resets_at_5h=int(now - 1000)))
+    r = queries.current_reading(recent_seconds=60)
+    assert r is not None and r["used_pct_5h"] == 40.0  # graceful fallback
+
+
 def test_list_conversations_merges_samples(env):
     _add_conversation("s1", title="With samples")
     _add_conversation("s2", title="No samples")
