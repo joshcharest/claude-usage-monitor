@@ -8,6 +8,7 @@ model: cumulative usage divided by how far through the window we are.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -64,7 +65,17 @@ def forecast_from_period_start(
     """
     secs_to_reset = (resets_at - now) if resets_at is not None else None
 
-    if used_pct is None or resets_at is None or window_length <= 0:
+    # Guard degenerate inputs: missing data, or a non-finite used_pct (NaN).
+    if (
+        used_pct is None
+        or (isinstance(used_pct, float) and not math.isfinite(used_pct))
+        or resets_at is None
+        or window_length <= 0
+    ):
+        return WindowForecast(None, None, None, None, secs_to_reset)
+
+    # Past the reset (stale row): don't extrapolate; hold at current, pace unknown.
+    if secs_to_reset is not None and secs_to_reset < 0:
         return WindowForecast(used_pct, None, used_pct, None, secs_to_reset)
 
     period_start = resets_at - window_length
@@ -73,6 +84,12 @@ def forecast_from_period_start(
         return WindowForecast(used_pct, None, used_pct, None, secs_to_reset)
 
     elapsed_fraction = min(elapsed / window_length, 1.0)
+    # Early-window guard: used_pct is a ROLLING metric, so dividing by a tiny
+    # elapsed fraction wildly over-projects. Until 20% of the window has elapsed,
+    # hold the projection at the current value and report pace as unknown.
+    if elapsed_fraction < 0.2:
+        return WindowForecast(used_pct, None, used_pct, None, secs_to_reset)
+
     avg_rate = used_pct / elapsed  # %/sec averaged over the elapsed period
     projected = min(used_pct / elapsed_fraction, cap)
     on_pace = projected <= 100.0

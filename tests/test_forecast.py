@@ -37,19 +37,29 @@ def test_period_start_just_opened_is_unknown():
     assert fc.projected_pct == 5.0
 
 
-def test_period_start_caps_runaway_early_ratio():
+def test_period_start_early_window_holds_no_runaway():
+    # <20% elapsed: a rolling metric must NOT be extrapolated from a tiny
+    # denominator. Hold at current and report pace as unknown.
     now = 1_000_000.0
-    resets = now + WINDOW_7D * 0.999  # 0.1% elapsed -> huge ratio
+    resets = now + WINDOW_7D * 0.999  # 0.1% elapsed
     fc = forecast_from_period_start(1.0, WINDOW_7D, resets, now, cap=999.0)
-    assert fc.projected_pct == 999.0
-    assert fc.on_pace is False
+    assert fc.projected_pct == 1.0  # held, not 999
+    assert fc.on_pace is None
 
 
-def test_period_start_past_reset_holds_at_current():
+def test_period_start_past_reset_holds_and_unknown():
     now = 1_000_000.0
-    resets = now - 100  # already past reset (stale)
+    resets = now - 100  # already past reset (stale snapshot)
     fc = forecast_from_period_start(80.0, WINDOW_7D, resets, now)
-    assert fc.projected_pct == 80.0  # elapsed_fraction clamped to 1.0
+    assert fc.projected_pct == 80.0  # held at current
+    assert fc.on_pace is None  # not extrapolated
+
+
+def test_period_start_nan_used_is_none():
+    fc = forecast_from_period_start(float("nan"), WINDOW_7D, 1_000_000.0, 990_000.0)
+    assert fc.current_pct is None
+    assert fc.projected_pct is None
+    assert fc.on_pace is None
 
 
 def test_period_start_none_used_is_none():

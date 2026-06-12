@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 
 import altair as alt
@@ -250,4 +251,6 @@ def _render_session_detail(gen: str, session_id: str) -> None:
 
 
 def _pct(v) -> str:
-    return f"{v:.0f}%" if isinstance(v, (int, float)) else "—"
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        return "—"
+    return f"{v:.0f}%"
