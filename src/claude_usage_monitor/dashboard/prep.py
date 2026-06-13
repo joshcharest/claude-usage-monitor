@@ -202,27 +202,64 @@ def _to_dt(rows: list[dict], col: str = "ts"):
     return to_local([r[col] for r in rows])
 
 
-def usage_frame(rows: list[dict]) -> pd.DataFrame:
-    """5h/7d used % over time (long format for a multi-series line)."""
-    if not rows:
-        return pd.DataFrame(columns=["time", "window", "used_pct"])
-    dt = _to_dt(rows)
-    records = []
-    for t, r in zip(dt, rows):
-        if r.get("used_pct_5h") is not None:
-            records.append({"time": t, "window": "5h", "used_pct": r["used_pct_5h"]})
-        if r.get("used_pct_7d") is not None:
-            records.append({"time": t, "window": "7d", "used_pct": r["used_pct_7d"]})
-    return pd.DataFrame(records)
+# Cap on points fed to the Usage-tab line/area charts. The raw per-sample stream
+# is huge over wide ranges (tens of thousands of points → very slow to render),
+# so frames downsample by time bucket to ~this many points. ~800 keeps lines
+# smooth while staying responsive.
+_USAGE_MAX_POINTS = 800
 
 
-def cost_frame(rows: list[dict]) -> pd.DataFrame:
-    """Cost over time (session running total per tick)."""
-    rows = [r for r in rows if r.get("cost_usd") is not None]
+def _downsample_by_time(df: pd.DataFrame, max_points: int, ts_col: str = "ts"):
+    """Reduce a per-sample frame to ~``max_points`` rows by time-bucketing, keeping
+    the last non-null value per bucket. No-op when already small enough."""
+    n = len(df)
+    if n <= max_points:
+        return df
+    df = df.sort_values(ts_col)
+    span = float(df[ts_col].iloc[-1] - df[ts_col].iloc[0])
+    if span <= 0:
+        return df.iloc[:: max(1, n // max_points)]
+    bucket = (df[ts_col] // (span / max_points)).astype("int64")
+    return df.groupby(bucket, sort=True).last().reset_index(drop=True)
+
+
+def usage_frame(rows: list[dict], max_points: int = _USAGE_MAX_POINTS) -> pd.DataFrame:
+    """5h/7d used % over time (long format for a multi-series line).
+
+    Time-bucketed down to ~``max_points`` per window so wide ranges stay fast.
+    """
+    cols = ["time", "window", "used_pct"]
     if not rows:
-        return pd.DataFrame(columns=["time", "cost_usd"])
-    return pd.DataFrame({"time": _to_dt(rows),
-                         "cost_usd": [r["cost_usd"] for r in rows]})
+        return pd.DataFrame(columns=cols)
+    df = _downsample_by_time(pd.DataFrame(rows), max_points)
+    if "ts" not in df.columns:
+        return pd.DataFrame(columns=cols)
+    df = df.assign(time=to_local(df["ts"]))
+    parts = []
+    for window, col in (("5h", "used_pct_5h"), ("7d", "used_pct_7d")):
+        if col in df.columns:
+            sub = df.loc[df[col].notna(), ["time", col]].rename(columns={col: "used_pct"})
+            sub["window"] = window
+            parts.append(sub[cols])
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=cols)
+
+
+def cost_frame(rows: list[dict], max_points: int = _USAGE_MAX_POINTS) -> pd.DataFrame:
+    """Cost over time (session running total per tick), time-bucketed for speed."""
+    cols = ["time", "cost_usd"]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(rows)
+    if "cost_usd" not in df.columns or "ts" not in df.columns:
+        return pd.DataFrame(columns=cols)
+    df = df[df["cost_usd"].notna()]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    df = _downsample_by_time(df, max_points)
+    # to_numpy() on both so a non-contiguous index (from the notna filter) can't
+    # misalign the two columns during DataFrame construction.
+    return pd.DataFrame({"time": to_local(df["ts"]).to_numpy(),
+                         "cost_usd": df["cost_usd"].to_numpy()})
 
 
 _PACE_COLS = ["time", "conversation", "share"]
