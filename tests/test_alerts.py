@@ -150,6 +150,100 @@ def test_projected_over_silent_after_reset():
     assert wa.over is False
 
 
+def _layered_config(**alerts_over):
+    # CONFIG with the layered forecast model switched ON for the over-leg.
+    cfg = json.loads(json.dumps(CONFIG))
+    cfg["forecast"]["model"] = "layered"
+    cfg["alerts"].update(alerts_over)
+    return cfg
+
+
+def test_alerts_over_leg_layered_fires_on_climbing_history():
+    # Layered model on + a steep fresh climb whose additive projection lands far
+    # over the threshold -> wa.over fires (and on_pace meaningful).
+    cfg = _layered_config(alert_over_pct=125.0)
+    reset = NOW + 9000.0  # 50% elapsed -> well past the early-window guard
+    # ~0.01 pp/sec over 9000s adds ~90pp on top of 60 -> ~150% projected.
+    samples = []
+    for i in range(12):
+        ts = NOW - 1800 + (1800 * i / 11)
+        used = 60.0 + 0.01 * (ts - (NOW - 1800))
+        samples.append({
+            "ts": ts, "session_id": "s", "used_pct_5h": used,
+            "resets_at_5h": reset, "used_pct_7d": None, "resets_at_7d": None,
+            "cost_usd": 1.0 + i,
+        })
+    current = {"used_pct_5h": samples[-1]["used_pct_5h"], "resets_at_5h": reset}
+    wa = alerts.evaluate_window("5h", samples, current, cfg, NOW)
+    assert wa.projected_pct is not None
+    assert wa.over is True
+
+
+def test_alerts_over_leg_layered_fires_in_early_window():
+    # CONTRACT CHANGE (intentional, early-window-blindness fix): the layered model
+    # has NO early-window guard — it always reports on_pace — so the "over" leg can
+    # trip in the first 20% of a window when a genuinely steep climb projects past
+    # the threshold. The legacy ratio model stayed silent there (on_pace None). Both
+    # are asserted below on the SAME early-window, fast-burn scenario.
+    reset = NOW + 18000 * 0.95  # only 5% elapsed
+    samples = []
+    for i in range(12):
+        ts = NOW - 1800 + (1800 * i / 11)
+        samples.append({
+            "ts": ts, "session_id": "s", "used_pct_5h": 30.0 + i * 2.0,  # steep
+            "resets_at_5h": reset, "used_pct_7d": None, "resets_at_7d": None,
+            "cost_usd": 1.0 + i,
+        })
+    cur_used = samples[-1]["used_pct_5h"]
+    current = {"used_pct_5h": cur_used, "resets_at_5h": reset}
+
+    # Layered: fires despite being early in the window.
+    wa = alerts.evaluate_window("5h", samples, current,
+                                _layered_config(alert_over_pct=125.0), NOW)
+    assert wa.over is True
+
+    # Ratio (default config): early-window guard suppresses the over leg.
+    wa_ratio = alerts.evaluate_window("5h", [], current, CONFIG, NOW)
+    assert wa_ratio.over is False
+
+
+def test_alerts_over_leg_default_config_stays_ratio():
+    # The bare CONFIG (no [forecast].model) must keep hitting the ratio model even
+    # when samples are present, so all the legacy over-leg expectations hold.
+    current = {"used_pct_5h": 70.0, "resets_at_5h": NOW + 9000}
+    samples = []  # the legacy tests pass [] to the over leg
+    wa = alerts.evaluate_window("5h", samples, current, CONFIG, NOW)
+    assert wa.projected_pct == pytest.approx(140.0)  # ratio: 70 / 0.5
+    assert wa.over is True
+
+
+def test_alerts_over_leg_gates_on_band_high_not_expected():
+    # Conservative gate: the over decision is made on projected_high (the band's
+    # upper end), so a case whose EXPECTED projection sits just below the threshold
+    # but whose band high crosses it still trips the alert. We assert the gate keys
+    # off projected_high by setting the threshold strictly between the two.
+    cfg = _layered_config()
+    reset = NOW + 9000.0  # 50% elapsed -> past the early-window guard
+    samples = []
+    for i in range(12):
+        ts = NOW - 1800 + (1800 * i / 11)
+        used = 60.0 + 0.01 * (ts - (NOW - 1800))
+        samples.append({
+            "ts": ts, "session_id": "s", "used_pct_5h": used,
+            "resets_at_5h": reset, "used_pct_7d": None, "resets_at_7d": None,
+            "cost_usd": 1.0 + i,
+        })
+    current = {"used_pct_5h": samples[-1]["used_pct_5h"], "resets_at_5h": reset}
+    base = alerts.evaluate_window("5h", samples, current, cfg, NOW)
+    assert base.projected_high is not None and base.projected_pct is not None
+    assert base.projected_high > base.projected_pct  # a real band exists
+    # Threshold strictly between expected and high: expected is UNDER, high is OVER.
+    mid = 0.5 * (base.projected_pct + base.projected_high)
+    cfg_mid = _layered_config(alert_over_pct=mid)
+    wa = alerts.evaluate_window("5h", samples, current, cfg_mid, NOW)
+    assert wa.over is True  # tripped by the conservative band high
+
+
 # ------------------------------------------------- cooldown / hysteresis / state
 
 

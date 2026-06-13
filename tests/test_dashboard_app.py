@@ -53,9 +53,12 @@ def test_app_runs_with_data(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch, with_samples=True)
     at = AppTest.from_file(APP, default_timeout=30).run()
     assert not at.exception
-    # The tabs render (Pace is split into a 5h and a 7d tab).
+    # The tabs render (Pace is split into a 5h and a 7d tab). The old standalone
+    # "Time" tab was intentionally retired: its content (window-elapsed gauge +
+    # resets-in countdown) now lives in the KPI row as the "Time Left" tiles
+    # (progress bar from elapsed_frac + duration value), so the tab was redundant.
     labels = {t.label for t in at.tabs}
-    assert {"5h Pace", "7d Pace", "Time", "Usage", "Models",
+    assert {"5h Pace", "7d Pace", "Usage", "Models",
             "Effort", "Conversations"} <= labels
     # KPI metrics present.
     assert len(at.metric) >= 3

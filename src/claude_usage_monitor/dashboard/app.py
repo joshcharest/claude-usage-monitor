@@ -113,6 +113,17 @@ st.markdown(
         background: rgba(239, 68, 68, 0.12);
       }
 
+      /* Vertical hairline between KPI window groups (5h | 7d | monthly). Sits in
+         its own narrow column; height roughly matches a tile + its progress bar. */
+      .km-kpi-sep {
+        width: 1px;
+        height: 76px;
+        margin: 4px auto 0;
+        background: linear-gradient(
+          to bottom, transparent, var(--km-border) 18%,
+          var(--km-border) 82%, transparent);
+      }
+
       /* In-tab context KPIs (e.g. the Pace Current/Projected/Status row) get an
          accent left-rail so the eye ties them to the chart that follows. */
       .stTabs [data-testid="stMetric"] {
@@ -226,16 +237,21 @@ def main_render() -> None:
         cap = float(config.get("alerts", {}).get("over_limit_pct", 100.0))
         # Notional $ used while over the cap on EITHER window, THIS calendar month.
         overage = data.overage_since("any", prep.month_start_epoch(now), cap)
+        # Window-spanning trailing history so the layered projector can fit a slope
+        # (recent) AND apply the roll-off decay (needs ~one full 7d window back);
+        # build_kpis falls back to the ratio model when this is thin/off.
+        hist_secs = float(config.get("forecast", {}).get("window_7d_seconds", 604800))
+        recent = data.usage_rows(hist_secs * 1.05)
         kpi.render_kpis(
-            prep.build_kpis(data.current_reading(), config, now, overage))
+            prep.build_kpis(data.current_reading(), config, now, overage, recent))
 
     _kpi_row()
 
     # Pace first so it's the default tab on load (Streamlit selects tab[0]);
     # split into a 5h and a 7d tab (identical layout, per window).
-    (tab_pace5, tab_pace7, tab_time, tab_usage,
+    (tab_pace5, tab_pace7, tab_usage,
      tab_models, tab_effort, tab_conv) = st.tabs(
-        ["5h Pace", "7d Pace", "Time", "Usage", "Models", "Effort", "Conversations"]
+        ["5h Pace", "7d Pace", "Usage", "Models", "Effort", "Conversations"]
     )
 
     with tab_pace5:
@@ -249,12 +265,6 @@ def main_render() -> None:
         def _pace7():
             panels.render_pace(controls, config, "7d")
         _pace7()
-
-    with tab_time:
-        @st.fragment(run_every=refresh)
-        def _time():
-            panels.render_time(controls, config)
-        _time()
 
     with tab_usage:
         @st.fragment(run_every="30s" if controls.live else None)

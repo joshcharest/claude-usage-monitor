@@ -57,6 +57,43 @@ reset_drop_pp = 40.0
 window_5h_seconds = 18000
 window_7d_seconds = 604800
 
+# --- Layered projection model (forecast_window) ------------------------------
+# Master switch: "layered" uses the new additive/decay projector everywhere;
+# "ratio" forces the legacy budget-burndown model (instant rollback / ship dark).
+model = "layered"
+# Trailing window (sec) over which the L1 OLS rate is fit from fresh used%
+# samples (30 min). Steadier than the alerts spike detector's 600s window.
+slope_window_seconds = 1800
+# Bucket size (sec) for the _bucketed_max dedupe before fitting the rate
+# (mirrors alerts.spike_bucket_seconds).
+slope_bucket_seconds = 30
+# Minimum deduped fresh buckets required to trust the slope; below this
+# forecast_window falls back to the ratio model.
+slope_min_points = 4
+# 5h: how long the live rate is trusted flat before mean-reverting (45 min).
+# Caps how far a momentary spike projects.
+burst_horizon_seconds = 2700
+# 5h: exponential time-constant (sec) for decaying the live rate toward the
+# recent baseline after the burst horizon.
+revert_tau_seconds = 3600
+# If no fresh sample (or no recent spend) within this many seconds, treat the
+# account as idle and set the future rate to 0 (project flat).
+idle_seconds = 600
+# 7d: time-constant (sec, 2 days) for mean-reverting the live rate toward its
+# recent baseline over the long horizon, so a live blip fades across the week.
+revert_tau_7d_seconds = 172800
+# L2 roll-off decay: coarse-bucket the window-spanning cost history to this
+# resolution for the aging profile, and walk the forward peak sim in this many
+# steps from now -> reset.
+decay_bucket_seconds = 900
+decay_sim_steps = 24
+# Half-width of the projected_low/high band as a fraction of predicted future
+# additions (expected +/- 25%); widened automatically when history is thin.
+band_frac = 0.25
+# Upper clamp on any projected value (matches forecast_from_period_start's cap),
+# so a degenerate calibration can't print absurd numbers.
+cap = 999.0
+
 # Phase 2 seam: tiered model/effort recommendation by 5-hour window usage.
 # Phase 1 only DISPLAYS the recommendation; it does not act on it.
 [[policy.tiers]]

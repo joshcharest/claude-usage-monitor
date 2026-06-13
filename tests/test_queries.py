@@ -201,6 +201,45 @@ def test_pace_timeseries_matches_forecast(env):
     assert len(series) == 1
     assert series[0]["projected_pct"] == pytest.approx(60.0)
     assert series[0]["on_pace"] is True
+    # Single-sample row -> thin history -> ratio fallback, band collapses to None.
+    assert series[0]["projected_low"] is None
+    assert series[0]["projected_high"] is None
+
+
+def test_pace_timeseries_layered_uses_history(env):
+    _add_conversation("s1")
+    t = 2_000_000.0
+    reset = int(t + 9000)  # 50% elapsed in the 5h window -> past early-window guard
+    # A steady fresh climb across the slope window: > slope_min_points buckets so
+    # the trailing buffer at the last row trips the layered (not ratio) path.
+    config = {
+        "forecast": {
+            "model": "layered",
+            "window_5h_seconds": 18000,
+            "window_7d_seconds": 604800,
+            "slope_window_seconds": 1800,
+            "slope_bucket_seconds": 30,
+            "slope_min_points": 4,
+            "burst_horizon_seconds": 18000,  # trust the rate flat the whole way
+            "idle_seconds": 100000,
+        }
+    }
+    for i in range(12):
+        ts = t - 1800 + (1800 * i // 11)
+        used = 40.0 + 0.002 * (ts - (t - 1800))
+        db.ingest(Sample(ts=ts, session_id="s1", used_pct_5h=used,
+                         resets_at_5h=reset, cost_usd=1.0 + i))
+    series = queries.pace_timeseries("5h", None, now=t, config=config)
+    assert len(series) == 12
+    # Output dicts carry the band keys (None where a row fell back to ratio).
+    assert "projected_low" in series[-1] and "projected_high" in series[-1]
+    last = series[-1]
+    # The final row has full trailing history -> layered additive projection that
+    # extends ABOVE the current reading (rate * secs_to_reset), with a real band.
+    assert last["projected_pct"] is not None
+    assert last["projected_pct"] >= last["used_pct"]
+    assert last["projected_low"] is not None
+    assert last["projected_low"] <= last["projected_pct"] <= last["projected_high"]
 
 
 def test_model_breakdown(env):

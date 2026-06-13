@@ -41,7 +41,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .forecast import forecast_from_period_start
+from .forecast import (
+    ForecastCfg,
+    forecast_from_period_start,
+    forecast_window,
+    model_is_layered,
+    window_inputs,
+)
 
 # --------------------------------------------------------------------- defaults
 # Mirrored into config/budget.toml [alerts]; config wins when present. Kept here
@@ -123,7 +129,12 @@ class WindowAlert:
     window: str
     # "projected over budget" leg
     projected_pct: float | None = None
-    over: bool = False  # projected_pct >= alert_over_pct AND on_pace is not None
+    # The CONSERVATIVE (upper) end of the forecast band, when the layered model
+    # supplies one. The 'over' decision is gated on THIS (not the expected
+    # ``projected_pct``) so an honest worst-case still trips the alert; it falls
+    # back to ``projected_pct`` for the ratio model (which has no band).
+    projected_high: float | None = None
+    over: bool = False  # projected_high >= alert_over_pct AND on_pace is not None
     # "spiking" leg
     slope_pp_per_min: float | None = None
     spiking: bool = False
@@ -292,13 +303,35 @@ def evaluate_window(
                 cur_reset = r[reset_col]
                 break
 
-    fc = forecast_from_period_start(
-        cur_used, _window_length(config, which), cur_reset, now
-    )
+    win_len = _window_length(config, which)
+    # Layered model: build the per-window (fresh, cost_rows) inputs the SAME way
+    # every reader does (window_inputs), so the slope machinery and per-session
+    # cost-delta handling aren't re-implemented here. forecast_window falls back to
+    # the ratio model on thin history. When the layered model is off (e.g. the
+    # alerts unit tests pass no [forecast].model and samples=[]), this is the legacy
+    # forecast_from_period_start verbatim.
+    #
+    # CONTRACT NOTE (intentional): the layered model has NO early-window guard — it
+    # always reports on_pace (the additive model is sound from the first samples).
+    # So the "over" leg can now fire in the first 20% of a window, where the ratio
+    # model stayed silent (on_pace=None). This is the early-window-blindness fix.
+    if model_is_layered(config) and fresh:
+        cfg = ForecastCfg.from_config(config)
+        fresh_b, cost_rows = window_inputs(samples, which, now, cfg)
+        fc = forecast_window(
+            cur_used, cur_reset, now, win_len,
+            fresh_samples=fresh_b, cost_rows=cost_rows, which=which, cfg=cfg,
+        )
+    else:
+        fc = forecast_from_period_start(cur_used, win_len, cur_reset, now)
     wa.projected_pct = fc.projected_pct
-    # Gate: only meaningful once past the early-window guard (on_pace is not None).
-    if fc.on_pace is not None and fc.projected_pct is not None:
-        wa.over = fc.projected_pct >= over_pct
+    wa.projected_high = fc.projected_high
+    # Gate: ratio model stays silent early (on_pace=None); the layered model always
+    # supplies on_pace, so it is allowed to trip early. Decide on the CONSERVATIVE
+    # end of the band (projected_high) when present; else the expected projection.
+    over_basis = fc.projected_high if fc.projected_high is not None else fc.projected_pct
+    if fc.on_pace is not None and over_basis is not None:
+        wa.over = over_basis >= over_pct
 
     # ---- "Spiking rapidly" leg --------------------------------------------
     win_s = float(_cfg(config, "spike_window_seconds"))

@@ -73,29 +73,6 @@ def _kato_modern_soft_theme() -> alt.theme.ThemeConfig:
     }
 
 
-def render_time(controls: Controls, config: dict) -> None:
-    """Where you are in each rolling window: elapsed vs remaining + countdown."""
-    latest = data.latest_sample()
-    if not latest:
-        st.info("No samples yet — enable the statusline monitor to populate this.")
-        return
-    now = time.time()
-    cols = st.columns(2)
-    for col, which, reset_key in zip(
-        cols, ("5h", "7d"), ("resets_at_5h", "resets_at_7d")
-    ):
-        with col:
-            win_len = prep.window_length(config, which)
-            pos = prep.window_position(latest.get(reset_key), win_len, now)
-            frac = pos["elapsed_frac"]
-            st.subheader(f"{which} window")
-            if frac is None:
-                st.caption("No rate-limit data (Free tier or not reported).")
-                continue
-            st.progress(frac, text=f"{frac * 100:.0f}% of window elapsed")
-            st.metric("Resets in", prep.fmt_duration(pos["remaining_secs"]))
-
-
 def render_pace(controls: Controls, config: dict, which: str) -> None:
     """Pace for one window ("5h" or "7d"): a rolling worst-case projection (left)
     and the accumulated fill of the CURRENT window (right). The two Pace tabs call
@@ -152,10 +129,10 @@ def render_pace(controls: Controls, config: dict, which: str) -> None:
     avg_min = max(1, round(smooth * bucket / 60))
     reset_note = " The cyan line marks where the current period started." if reset_lines else ""
 
-    # Fixed shared y-axis top (0–150) so both charts ALIGN: identical gridlines
-    # and y-label widths, which makes their plot areas — and thus x-axis lengths —
-    # equal under width="stretch". A projection above 150% clips at the top.
-    y_top = 150.0
+    # Fixed shared y-axis top so both charts in the tab ALIGN (identical gridlines
+    # and y-label widths -> equal plot areas / x-axis lengths). 7d stays close to
+    # the ceiling (rarely projects high); 5h leaves room for worst-case spikes.
+    y_top = 110.0 if which == "7d" else 150.0
 
     # Side-by-side so both charts fit above the fold. Only the right chart is
     # split by conversation, so its legend is suppressed and drawn once below.

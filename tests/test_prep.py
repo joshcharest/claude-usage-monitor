@@ -66,8 +66,8 @@ def test_controls_window_seconds():
 
 
 _KPI_LABELS = [
-    "5 Hour Used", "5 Hour Projected", "Time Left",
-    "7 Day Used", "7 Day Projected", "Time Left", "Over-limit Spend",
+    "Time Left", "5 Hour Used", "5 Hour Projected",
+    "Time Left", "7 Day Used", "7 Day Projected", "Monthly Overage",
 ]
 
 
@@ -76,6 +76,7 @@ def test_build_kpis_empty():
     assert [k.label for k in kpis] == _KPI_LABELS
     assert all(k.value == "—" for k in kpis)
     assert all(k.status is None for k in kpis)
+    assert all(k.progress is None for k in kpis)  # no bars without data
 
 
 def test_build_kpis_with_sample():
@@ -91,14 +92,69 @@ def test_build_kpis_with_sample():
         "effort": "high",
     }
     kpis = prep.build_kpis(latest, config, now, overage_usd=42.5)
-    # 5h trio, 7d trio, then the over-limit-spend tile.
+    # Each window trio is [Time Left, Used, Projected]; then the monthly tile.
     assert [k.label for k in kpis] == _KPI_LABELS
-    assert kpis[0].value == "30%"      # 5 Hour Used
-    assert kpis[1].value == "60%"      # 5 Hour Projected (half-elapsed -> 60%)
-    assert kpis[1].status == "ok"      # 60% < warn 90% -> on pace (green tile)
-    assert kpis[2].value == "2h30m"    # Time Left until 5h reset (9000 s)
-    assert kpis[3].value == "40%"      # 7 Day Used
-    assert kpis[6].value == "$42.50"   # Over-limit Spend
+    assert kpis[0].value == "2h30m"    # Time Left until 5h reset (9000 s)
+    assert kpis[1].value == "30%"      # 5 Hour Used
+    assert kpis[2].value == "60%"      # 5 Hour Projected (half-elapsed -> 60%)
+    assert kpis[2].status == "ok"      # 60% < warn 90% -> on pace (green tile)
+    assert kpis[4].value == "40%"      # 7 Day Used
+    assert kpis[6].value == "$42.50"   # Monthly Overage
+    # Groups drive the separators: 5h trio, 7d trio, then the monthly tile.
+    assert [k.group for k in kpis] == ["5h", "5h", "5h", "7d", "7d", "7d", "other"]
+    # Gauge bars: window-elapsed on the Time Left tiles, used % on the Used tiles.
+    assert kpis[0].progress == pytest.approx(0.50)  # 5h Time Left (half elapsed)
+    assert kpis[1].progress == pytest.approx(0.30)  # 5 Hour Used
+    assert kpis[3].progress == pytest.approx(0.50)  # 7d Time Left (half elapsed)
+    assert kpis[4].progress == pytest.approx(0.40)  # 7 Day Used
+    # Projected and monthly tiles stay text-only (no bar).
+    assert kpis[2].progress is None and kpis[6].progress is None
+
+
+def test_build_kpis_layered_with_recent():
+    # Passing a trailing fresh series under the layered model produces a layered
+    # projection while keeping the exact same 7-tile shape/labels.
+    now = 2_000_000.0
+    reset = now + 9000.0  # 50% elapsed in the 5h window
+    config = {
+        "alerts": {"warn_projected_pct": 90.0, "over_limit_pct": 100.0},
+        "forecast": {
+            "model": "layered",
+            "window_5h_seconds": 18000,
+            "window_7d_seconds": 604800,
+            "slope_window_seconds": 1800,
+            "slope_bucket_seconds": 30,
+            "slope_min_points": 4,
+            "burst_horizon_seconds": 18000,
+            "idle_seconds": 100000,
+        },
+    }
+    recent = []
+    for i in range(12):
+        ts = now - 1800 + (1800 * i / 11)
+        used = 40.0 + 0.002 * (ts - (now - 1800))
+        recent.append({"ts": ts, "session_id": "s1", "used_pct_5h": used,
+                       "resets_at_5h": reset, "cost_usd": 1.0 + i})
+    latest = {"used_pct_5h": recent[-1]["used_pct_5h"], "resets_at_5h": reset,
+              "used_pct_7d": 40.0, "resets_at_7d": now + 604800 / 2}
+    kpis = prep.build_kpis(latest, config, now, overage_usd=0.0, recent=recent)
+    # Same 7-tile shape and groups as the ratio path.
+    assert [k.label for k in kpis] == _KPI_LABELS
+    assert [k.group for k in kpis] == ["5h", "5h", "5h", "7d", "7d", "7d", "other"]
+    # The 5h Projected tile shows a real layered projection at/above the used %.
+    assert kpis[2].value != "—"
+    # The layered band is surfaced in the Projected tile's tooltip (low–high range).
+    assert kpis[2].help is not None and "likely range" in kpis[2].help
+
+
+def test_build_kpis_without_recent_stays_ratio():
+    # No `recent` -> ratio fallback -> exact legacy numbers (regression anchor).
+    config = load_config()
+    now = 1_000_000.0
+    latest = {"used_pct_5h": 30.0, "resets_at_5h": now + 18000 / 2,
+              "used_pct_7d": 40.0, "resets_at_7d": now + 604800 / 2}
+    kpis = prep.build_kpis(latest, config, now)
+    assert kpis[2].value == "60%"  # half-elapsed ratio doubles 30 -> 60
 
 
 def test_build_kpis_projected_status_thresholds():
@@ -108,7 +164,7 @@ def test_build_kpis_projected_status_thresholds():
     def proj_status(used_5h):
         # half-elapsed 5h window -> projected = used / 0.5 = 2 * used
         latest = {"used_pct_5h": used_5h, "resets_at_5h": now + 18000 / 2}
-        return prep.build_kpis(latest, config, now)[1].status
+        return prep.build_kpis(latest, config, now)[2].status  # 5 Hour Projected
 
     assert proj_status(30.0) == "ok"     # proj 60%  < warn 90
     assert proj_status(47.0) == "warn"   # proj 94%  in [90, 100)

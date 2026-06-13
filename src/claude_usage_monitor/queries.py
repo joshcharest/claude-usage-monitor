@@ -16,7 +16,12 @@ from typing import Any
 
 from . import db, index_db
 from .config import load_config
-from .forecast import forecast_from_period_start
+from .forecast import (
+    ForecastCfg,
+    forecast_from_period_start,
+    forecast_window,
+    model_is_layered,
+)
 
 _ORDER_SQL = {
     "started_desc": "started_at DESC",
@@ -418,15 +423,44 @@ def pace_timeseries(
         length = float(_get(config, "forecast", "window_5h_seconds", default=18000))
         used_col, reset_col = "used_pct_5h", "resets_at_5h"
 
+    rows = usage_timeseries(window_seconds, now=now, budget_conn=budget_conn)
+    layered = model_is_layered(config)
+    cfg = ForecastCfg.from_config(config) if layered else None
+    # A rolling trailing buffer (raw rows within ~one window) walked oldest->newest
+    # so each row's forecast sees only its own trailing history — exactly what the
+    # live statusline would have had AT that sample's instant. On thin history
+    # forecast_window falls back to the ratio model, so a single early row
+    # reproduces the legacy number (test_pace_timeseries_matches_forecast).
+    buf: list[dict] = []
+
     out = []
-    for row in usage_timeseries(window_seconds, now=now, budget_conn=budget_conn):
-        fc = forecast_from_period_start(row[used_col], length, row[reset_col], row["ts"])
+    for row in rows:
+        ts = row["ts"]
+        if layered and cfg is not None:
+            from .forecast import window_inputs  # local: avoids top-level churn
+
+            buf.append(row)
+            # Keep ~one full window of trailing rows: the slope fit filters to its
+            # own window internally, while the roll-off decay needs history reaching
+            # back ~`length` so the chart's projection matches the live statusline.
+            cutoff = ts - length
+            if buf and buf[0]["ts"] < cutoff:
+                buf = [r for r in buf if r["ts"] >= cutoff]
+            fresh, cost = window_inputs(buf, which, ts, cfg)
+            fc = forecast_window(
+                row[used_col], row[reset_col], ts, length,
+                fresh_samples=fresh, cost_rows=cost, which=which, cfg=cfg,
+            )
+        else:
+            fc = forecast_from_period_start(row[used_col], length, row[reset_col], ts)
         out.append(
             {
-                "ts": row["ts"],
+                "ts": ts,
                 "session_id": row.get("session_id"),
                 "used_pct": fc.current_pct,
                 "projected_pct": fc.projected_pct,
+                "projected_low": fc.projected_low,
+                "projected_high": fc.projected_high,
                 "on_pace": fc.on_pace,
                 "reset_at": row[reset_col],
                 "cost_usd": row.get("cost_usd"),

@@ -24,7 +24,12 @@ from typing import Any
 
 from . import alerts, db, queries
 from .config import load_config
-from .forecast import WindowForecast, forecast_from_period_start
+from .forecast import (
+    ForecastCfg,
+    WindowForecast,
+    forecast_for_window,
+    model_is_layered,
+)
 
 
 def _get(d: Any, *path: str, default: Any = None) -> Any:
@@ -132,19 +137,53 @@ def _overage_markers(
     return out
 
 
-def _evaluate_alerts(now: float, config: dict[str, Any]) -> list[str]:
-    """Evaluate usage alerts for this tick and return statusline markers.
+def _recent_samples(now: float, config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Trailing raw samples covering both the slope and spike windows.
 
-    Reads recent FRESH samples + the synthesized current reading, runs the pure
-    detection engine (fires due desktop notifications, persists state), and adds
-    an overage marker when currently over a cap. Fully wrapped: any failure
-    degrades to no markers so the statusline never breaks.
+    Fetched ONCE per tick and reused for the layered forecast AND the alert
+    engine (so render() never issues two history queries). The span is the wider
+    of the forecast slope window and the alerts spike window, with 50% headroom so
+    the trailing-slope fit is fully covered. Degrades to [] on any failure.
     """
     try:
-        win_s = float(alerts._cfg(config, "spike_window_seconds"))
-        # Pull a little extra history so the trailing-slope window is fully covered.
-        samples = queries.usage_timeseries(win_s * 1.5, now=now)
-        current = queries.current_reading()
+        spike_w = float(alerts._cfg(config, "spike_window_seconds"))
+        slope_w = float(ForecastCfg.from_config(config).slope_window_seconds)
+        return queries.usage_timeseries(max(spike_w, slope_w) * 1.5, now=now)
+    except Exception:
+        return []
+
+
+def _forecast_history(now: float, config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Window-spanning trailing samples for the layered forecast's roll-off decay.
+
+    The decay term needs cost/used history reaching back ~one full window (what ages
+    off the back of the rolling window over the remaining time was added up to a
+    window ago). Spans the larger 7d window with headroom. Kept SEPARATE from
+    :func:`_recent_samples` so the alert engine isn't handed a week of rows (which
+    would perturb its reset detection). Degrades to [] on failure → the forecast
+    simply drops the decay term and uses the additive value-at-reset.
+    """
+    try:
+        win_7d = float(_get(config, "forecast", "window_7d_seconds", default=604800))
+        return queries.usage_timeseries(win_7d * 1.05, now=now)
+    except Exception:
+        return []
+
+
+def _evaluate_alerts(
+    now: float,
+    config: dict[str, Any],
+    samples: list[dict[str, Any]],
+    current: dict[str, Any] | None,
+) -> list[str]:
+    """Evaluate usage alerts for this tick and return statusline markers.
+
+    Takes the pre-fetched FRESH samples + synthesized current reading (so we don't
+    re-query), runs the pure detection engine (fires due desktop notifications,
+    persists state), and adds an overage marker when currently over a cap. Fully
+    wrapped: any failure degrades to no markers so the statusline never breaks.
+    """
+    try:
         state = alerts.run_tick(samples, current, config, now)
         return state.markers() + _overage_markers(current, now, config)
     except Exception:
@@ -160,18 +199,28 @@ def render(payload: dict[str, Any], now: float, config: dict[str, Any]) -> str:
     except Exception:
         pass
 
-    # Both windows project from average pace since the window opened.
-    fc_5h = forecast_from_period_start(
-        sample.used_pct_5h,
-        _get(config, "forecast", "window_5h_seconds", default=18000),
-        sample.resets_at_5h,
-        now,
+    # Fetch trailing history ONCE and reuse it for both the layered forecast and
+    # the alert engine. forecast_for_window falls back to the legacy ratio model
+    # when the layered model is off OR history is thin, so this never regresses the
+    # bare-sample line. The current reading is the alert engine's projection basis.
+    samples = _recent_samples(now, config)
+    # A wider, window-spanning history just for the forecast's roll-off decay (the
+    # alert engine keeps the short `samples` so its reset detection is unperturbed).
+    fc_hist = _forecast_history(now, config) if model_is_layered(config) else samples
+    try:
+        current = queries.current_reading()
+    except Exception:
+        current = None
+
+    fc_5h = forecast_for_window(
+        "5h", sample.used_pct_5h, sample.resets_at_5h,
+        float(_get(config, "forecast", "window_5h_seconds", default=18000)),
+        now, fc_hist, config,
     )
-    fc_7d = forecast_from_period_start(
-        sample.used_pct_7d,
-        _get(config, "forecast", "window_7d_seconds", default=604800),
-        sample.resets_at_7d,
-        now,
+    fc_7d = forecast_for_window(
+        "7d", sample.used_pct_7d, sample.resets_at_7d,
+        float(_get(config, "forecast", "window_7d_seconds", default=604800)),
+        now, fc_hist, config,
     )
 
     warn = float(_get(config, "alerts", "warn_projected_pct", default=90.0))
@@ -189,7 +238,7 @@ def render(payload: dict[str, Any], now: float, config: dict[str, Any]) -> str:
 
     # Evaluate alerts AFTER ingesting this tick's sample so the current reading is
     # included; prepend any markers. Never lets an alert failure break the line.
-    markers = _evaluate_alerts(now, config)
+    markers = _evaluate_alerts(now, config, samples, current)
     if markers:
         line = "  ".join(markers) + "  ·  " + line
 

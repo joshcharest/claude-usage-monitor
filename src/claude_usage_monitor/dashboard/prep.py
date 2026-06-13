@@ -4,8 +4,8 @@ This is the unit-test surface. Every function takes plain query rows and returns
 plain structures / pandas DataFrames ready for charting. The Streamlit layer
 (`panels.py`, `kpi.py`, `app.py`) only calls these and `st.*`.
 
-`forecast_from_period_start` and `load_config` are reused so the dashboard's
-pace numbers and thresholds match the statusline exactly.
+`forecast_for_window` and `load_config` are reused so the dashboard's pace
+numbers and thresholds match the statusline exactly.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from ..forecast import forecast_from_period_start
+from ..forecast import forecast_for_window
 
 
 def _local_tz():
@@ -91,6 +91,13 @@ class Kpi:
     # "ok" (on pace) | "warn" | "over" | None (neutral). Replaces the old delta
     # "pill", so every tile is the same height.
     status: str | None = None
+    # Optional 0–1 fraction that draws a slim progress bar under the value (used %
+    # for the Used tiles, window-elapsed fraction for the Time Left tiles). None =
+    # no bar, so non-gauge tiles (Projected, Over-limit Spend) stay text-only.
+    progress: float | None = None
+    # Cluster id ("5h" / "7d" / "other") used by kpi.py to draw a vertical
+    # separator wherever the group changes, so the eye reads the tiles as windows.
+    group: str | None = None
 
 
 def _cfg(config: dict, *path: str, default: Any = None) -> Any:
@@ -141,32 +148,54 @@ def window_position(
 
 
 def build_kpis(
-    latest: dict | None, config: dict, now: float, overage_usd: float | None = None
+    latest: dict | None,
+    config: dict,
+    now: float,
+    overage_usd: float | None = None,
+    recent: list[dict] | None = None,
 ) -> list[Kpi]:
     """Top-of-page KPIs: a 5h trio, a 7d trio, then an over-limit-spend tile.
 
     The two Projected tiles carry a ``status`` ("ok"/"warn"/"over") that colors the
     tile itself; ``overage_usd`` (notional $ spent while over the cap) populates the
     far-right tile.
+
+    ``recent`` is the trailing raw sample stream (newest-last) the dashboard fetches
+    so the layered projector can fit a slope; when ``None`` (or ``[forecast].model``
+    is off) the projection is the legacy ratio model — byte-identical to before — so
+    callers that pass no history stay on the old numbers.
     """
     warn = float(_cfg(config, "alerts", "warn_projected_pct", default=90.0))
     money = (f"${overage_usd:,.2f}" if overage_usd is not None else "—")
     if not latest:
         return [
-            Kpi("5 Hour Used", "—"), Kpi("5 Hour Projected", "—"), Kpi("Time Left", "—"),
-            Kpi("7 Day Used", "—"), Kpi("7 Day Projected", "—"), Kpi("Time Left", "—"),
-            Kpi("Over-limit Spend", money, help="notional $ used while over the limit, this month"),
+            Kpi("Time Left", "—", group="5h"), Kpi("5 Hour Used", "—", group="5h"),
+            Kpi("5 Hour Projected", "—", group="5h"),
+            Kpi("Time Left", "—", group="7d"), Kpi("7 Day Used", "—", group="7d"),
+            Kpi("7 Day Projected", "—", group="7d"),
+            Kpi("Monthly Overage", money, group="other",
+            help="notional $ used while over the limit, this calendar month"),
         ]
 
-    fc5 = forecast_from_period_start(
-        latest.get("used_pct_5h"), window_length(config, "5h"),
-        latest.get("resets_at_5h"), now)
-    fc7 = forecast_from_period_start(
-        latest.get("used_pct_7d"), window_length(config, "7d"),
-        latest.get("resets_at_7d"), now)
+    fc5 = forecast_for_window(
+        "5h", latest.get("used_pct_5h"), latest.get("resets_at_5h"),
+        window_length(config, "5h"), now, recent, config)
+    fc7 = forecast_for_window(
+        "7d", latest.get("used_pct_7d"), latest.get("resets_at_7d"),
+        window_length(config, "7d"), now, recent, config)
 
     def pct(v):
         return f"{v:.0f}%" if v is not None else "—"
+
+    def used_frac(v):
+        # Fill the bar by current used %, clamped so an over-limit reading pins
+        # the bar full rather than overflowing st.progress's 0–1 contract.
+        return None if v is None else max(0.0, min(v / 100.0, 1.0))
+
+    def elapsed_frac(which):
+        return window_position(
+            latest.get(f"resets_at_{which}"), window_length(config, which), now
+        )["elapsed_frac"]
 
     def proj_status(fc):
         # Tile color: >=100% over (red), >=warn caution (amber), else on pace
@@ -182,16 +211,33 @@ def build_kpis(
             return "warn"
         return "ok"
 
+    def proj_help(fc):
+        # Surface the layered model's uncertainty band in the tile tooltip (small +
+        # safe: no layout change). The ratio fallback has no band, so we just label
+        # the expected projection. TODO: a richer in-tile band visual (e.g. a
+        # low–high range under the value) could replace this tooltip later.
+        if fc.projected_low is not None and fc.projected_high is not None:
+            return (
+                f"expected end-of-window usage; likely range "
+                f"{fc.projected_low:.0f}–{fc.projected_high:.0f}%"
+            )
+        return "projected end-of-window usage"
+
     return [
-        Kpi("5 Hour Used", pct(fc5.current_pct)),
-        Kpi("5 Hour Projected", pct(fc5.projected_pct), status=proj_status(fc5)),
         Kpi("Time Left", fmt_duration(fc5.secs_to_reset),
-            help="until the 5h window resets"),
-        Kpi("7 Day Used", pct(fc7.current_pct)),
-        Kpi("7 Day Projected", pct(fc7.projected_pct), status=proj_status(fc7)),
+            help="until the 5h window resets", progress=elapsed_frac("5h"), group="5h"),
+        Kpi("5 Hour Used", pct(fc5.current_pct),
+            progress=used_frac(fc5.current_pct), group="5h"),
+        Kpi("5 Hour Projected", pct(fc5.projected_pct),
+            status=proj_status(fc5), help=proj_help(fc5), group="5h"),
         Kpi("Time Left", fmt_duration(fc7.secs_to_reset),
-            help="until the 7d window resets"),
-        Kpi("Over-limit Spend", money, help="notional $ used while over the limit, this month"),
+            help="until the 7d window resets", progress=elapsed_frac("7d"), group="7d"),
+        Kpi("7 Day Used", pct(fc7.current_pct),
+            progress=used_frac(fc7.current_pct), group="7d"),
+        Kpi("7 Day Projected", pct(fc7.projected_pct),
+            status=proj_status(fc7), help=proj_help(fc7), group="7d"),
+        Kpi("Monthly Overage", money, group="other",
+            help="notional $ used while over the limit, this calendar month"),
     ]
 
 
