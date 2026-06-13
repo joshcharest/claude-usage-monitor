@@ -48,6 +48,14 @@ def pace_rows(which: str, window_seconds: float | None) -> list[dict]:
     return queries.pace_timeseries(which, window_seconds, now=time.time())
 
 
+@st.cache_data(ttl=6)
+def overage(which: str, window_seconds: float | None, over_pct: float = 100.0) -> float:
+    """Notional $ burned while ``which`` was at/over the cap, within the range."""
+    now = time.time()
+    since = (now - window_seconds) if window_seconds else None
+    return queries.overage_spend_usd(which, over_pct=over_pct, since=since, now=now)
+
+
 @st.cache_data(ttl=60)
 def session_labels(_gen: str) -> dict:
     return queries.session_labels()

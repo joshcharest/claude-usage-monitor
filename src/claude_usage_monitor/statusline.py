@@ -103,13 +103,42 @@ def _window_segment(label: str, fc: WindowForecast, warn_pct: float, now: float)
     return f"{label} {cur} → {proj} {_glyph(fc, warn_pct)} ({reset})"
 
 
+def _overage_markers(
+    current: dict[str, Any] | None, now: float, config: dict[str, Any]
+) -> list[str]:
+    """When a window is currently AT/OVER the cap, a '💸 <win> +$X' marker.
+
+    ``X`` is the notional $ burned WHILE over the cap during the current period
+    (queries.overage_spend_usd, scoped to this period's start). Computed only when
+    actually over, so the statusline stays quiet the rest of the time.
+    """
+    if not current:
+        return []
+    cap = float(alerts._cfg(config, "over_limit_pct"))
+    out: list[str] = []
+    for which in alerts.WINDOWS:
+        used_col, reset_col = alerts._COLS[which]
+        used = current.get(used_col)
+        reset = current.get(reset_col)
+        if used is None or reset is None or float(used) < cap:
+            continue
+        win_len = float(alerts._window_length(config, which))
+        period_start = float(reset) - win_len
+        spend = queries.overage_spend_usd(
+            which, over_pct=cap, since=period_start, now=now
+        )
+        if spend > 0:
+            out.append(f"💸 {which} +${spend:,.2f}")
+    return out
+
+
 def _evaluate_alerts(now: float, config: dict[str, Any]) -> list[str]:
     """Evaluate usage alerts for this tick and return statusline markers.
 
     Reads recent FRESH samples + the synthesized current reading, runs the pure
-    detection engine, fires any due desktop notifications (cooldown-gated), and
-    persists alert state. Fully wrapped: any failure degrades to no markers so the
-    statusline never breaks.
+    detection engine (fires due desktop notifications, persists state), and adds
+    an overage marker when currently over a cap. Fully wrapped: any failure
+    degrades to no markers so the statusline never breaks.
     """
     try:
         win_s = float(alerts._cfg(config, "spike_window_seconds"))
@@ -117,7 +146,7 @@ def _evaluate_alerts(now: float, config: dict[str, Any]) -> list[str]:
         samples = queries.usage_timeseries(win_s * 1.5, now=now)
         current = queries.current_reading()
         state = alerts.run_tick(samples, current, config, now)
-        return state.markers()
+        return state.markers() + _overage_markers(current, now, config)
     except Exception:
         return []
 

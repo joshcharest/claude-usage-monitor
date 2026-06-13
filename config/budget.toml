@@ -38,6 +38,18 @@ cooldown_seconds = 1800.0
 # Hysteresis: stay latched (marker shown) until the metric falls below
 # threshold * clear_factor, so it doesn't flap at the boundary.
 clear_factor = 0.9
+# "Reset after exceeded": notify when a window resets, but ONLY if usage had hit
+# the cap during the period that just ended (so you learn usage is available
+# again — but only when you'd actually run out).
+reset_notify = true
+# "Over the limit" cap (%). Reaching this = exceeded. Used by the reset-notify
+# gate above AND the dashboard/statusline overage $-tracker.
+over_limit_pct = 100.0
+# A reset is detected when the FRESH used% drops by at least this many points
+# between ticks (a sharp collapse only happens on reset; the rolling counter
+# never ages out this fast). The reset time advancing is also accepted, but is
+# unreliable — Anthropic may reset usage WITHOUT advancing it.
+reset_drop_pp = 40.0
 
 [forecast]
 # Each window projects from average pace since it opened (budget burndown).

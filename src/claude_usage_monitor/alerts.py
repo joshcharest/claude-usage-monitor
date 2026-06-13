@@ -1,6 +1,6 @@
 """Usage-alert detection engine + a small delivery helper.
 
-Two conditions are detected from the live ``budget.db`` sample stream:
+Three conditions are detected from the live ``budget.db`` sample stream:
 
 1. **Projected WAY over** — the budget-burndown forecast projects the current
    FRESH reading to land at/above a hard threshold (default 125%) before the
@@ -10,7 +10,12 @@ Two conditions are detected from the live ``budget.db`` sample stream:
 2. **Spiking rapidly** — FRESH ``used_pct`` is climbing faster than a threshold
    (default 5 pp/min) over a short trailing window (default last 10 min).
 
-Both conditions are computed PER WINDOW ("5h" and "7d"). The detection layer is
+3. **Reset after exceeded** — the window RESET (a sharp drop in the FRESH reading,
+   or the reset time advancing) following a period that reached the cap (default
+   100%). This is an edge-triggered notification, not a latched marker: it tells
+   you usage is available again, but only fires if you'd actually been over.
+
+All conditions are computed PER WINDOW ("5h" and "7d"). The detection layer is
 pure (no I/O, no clock-of-its-own): inputs are recent samples + config + ``now``
 + prior state; output is a structured :class:`AlertState`. State (last-fired
 times, for cooldown/debounce) is persisted by the thin JSON helpers at the bottom,
@@ -61,6 +66,24 @@ DEFAULTS: dict[str, Any] = {
     # Hysteresis: once firing, keep the marker shown until the metric falls below
     # threshold * this factor (so it doesn't flap right at the boundary).
     "clear_factor": 0.9,
+    # --- Reset-after-exceeded notification + overage tracking ---
+    # Fire a "limit reset" notification when a window resets, but ONLY if usage
+    # had reached the cap during the period that just ended.
+    "reset_notify": True,
+    # "Over the limit" cap: used for the exceeded-gate above AND the overage
+    # $-tracker (queries.overage_spend_usd). Reaching this = exceeded.
+    "over_limit_pct": 100.0,
+    # A reset is detected when the FRESH reading drops by at least this many
+    # percentage-points between ticks (a sharp collapse only happens on reset;
+    # the rolling counter ages out gradually, never this fast). The reset time
+    # advancing is also accepted as a reset signal — but it is unreliable
+    # (Anthropic may reset usage WITHOUT advancing resets_at), hence the drop test.
+    "reset_drop_pp": 40.0,
+    # The over-cap period must have lasted at least this long to count as
+    # "exceeded" for the reset-notify gate. Guards against a one-tick blip back to
+    # the cap (a hung session momentarily winning the reading) spuriously
+    # re-arming the notification. A genuine over-period lasts far longer.
+    "reset_min_over_seconds": 300.0,
 }
 
 WINDOWS = ("5h", "7d")
@@ -128,6 +151,11 @@ class AlertState:
     notifications: list[dict[str, str]] = field(default_factory=list)
     fired_at: dict[str, float] = field(default_factory=dict)
     active: dict[str, bool] = field(default_factory=dict)
+    # Per-window reset tracking carried across ticks: {which: {peak, last, resets_at}}.
+    # ``peak`` = max FRESH used% since the last detected reset (the exceeded-gate),
+    # ``last`` = previous tick's FRESH used% (to spot a sharp collapse), ``resets_at``
+    # = previous tick's reset time (to spot an advance).
+    period: dict[str, Any] = field(default_factory=dict)
 
     @property
     def any_alerting(self) -> bool:
@@ -289,6 +317,110 @@ def evaluate_window(
     return wa
 
 
+def _fresh_current(current: dict | None, which: str) -> tuple[float | None, float | None]:
+    """The synthesized current reading's (used%, resets_at) for a window, or Nones.
+
+    Returns the used% only when finite; the reset time is passed through as-is.
+    """
+    if current is None:
+        return None, None
+    used_col, reset_col = _COLS[which]
+    used = current.get(used_col)
+    reset = current.get(reset_col)
+    try:
+        used = float(used)
+        if not math.isfinite(used):
+            used = None
+    except (TypeError, ValueError):
+        used = None
+    return used, reset
+
+
+def _track_reset(
+    which: str,
+    current: dict | None,
+    period_prev: dict[str, Any],
+    state: AlertState,
+    notifications: list[dict[str, str]],
+    now: float,
+    *,
+    cap: float,
+    drop: float,
+    cooldown: float,
+    notify: bool,
+    min_over: float,
+) -> None:
+    """Detect a window reset and queue a 'limit reset' notification if exceeded.
+
+    Updates ``state.period[which]`` (carried to the next tick) and, on a detected
+    reset that follows a SUSTAINED over-cap period, appends a cooldown-gated
+    notification and stamps ``state.fired_at``. A reset is either a sharp
+    single-tick drop in the FRESH used% (>= ``drop`` pp) or the reset time
+    advancing > 1h. The "exceeded" gate requires the over-cap streak to have
+    lasted >= ``min_over`` seconds, so a one-tick blip back to the cap (a hung
+    session momentarily winning the reading) can't re-arm a spurious notification.
+    ``over_since`` tracks the start of the current at/over-cap streak (None when
+    below the cap).
+    """
+    cur_used, cur_reset = _fresh_current(current, which)
+    pp = period_prev.get(which) or {}
+    prev_peak = float(pp.get("peak") or 0.0)
+    prev_last = pp.get("last")
+    prev_reset = pp.get("resets_at")
+    prev_over_since = pp.get("over_since")
+
+    collapsed = (
+        prev_last is not None
+        and cur_used is not None
+        and (float(prev_last) - cur_used) >= drop
+    )
+    advanced = (
+        cur_reset is not None
+        and prev_reset is not None
+        and float(cur_reset) > float(prev_reset) + 3600.0
+    )
+    reset_detected = collapsed or advanced
+
+    # Was the period that just ended a SUSTAINED over-cap run (not a transient
+    # blip)? Measured as of the prior tick's streak start.
+    exceeded = (
+        prev_peak >= cap
+        and prev_over_since is not None
+        and (now - float(prev_over_since)) >= min_over
+    )
+
+    over_now = cur_used is not None and cur_used >= cap
+    if reset_detected:
+        key = f"{which}_reset"
+        if notify and exceeded:
+            last_fired = state.fired_at.get(key)
+            if last_fired is None or now - last_fired >= cooldown:
+                notifications.append({
+                    "key": key,
+                    "title": f"{which} limit reset — usage available again",
+                    "body": (
+                        f"Your {which} usage limit just reset; it had hit "
+                        f"{prev_peak:.0f}% (over the cap) before resetting."
+                    ),
+                })
+                state.fired_at[key] = now
+        new_peak = cur_used or 0.0
+        new_over_since = now if over_now else None
+    else:
+        new_peak = max(prev_peak, cur_used) if cur_used is not None else prev_peak
+        new_over_since = (
+            (prev_over_since if prev_over_since is not None else now)
+            if over_now else None
+        )
+
+    state.period[which] = {
+        "peak": new_peak,
+        "last": cur_used if cur_used is not None else prev_last,
+        "resets_at": cur_reset if cur_reset is not None else prev_reset,
+        "over_since": new_over_since,
+    }
+
+
 def evaluate(
     samples: list[dict],
     current: dict | None,
@@ -321,11 +453,16 @@ def evaluate(
     prior = prior or {}
     fired_at: dict[str, float] = dict(prior.get("fired_at") or {})
     active_prev: dict[str, bool] = dict(prior.get("active") or {})
+    period_prev: dict[str, Any] = dict(prior.get("period") or {})
 
     cooldown = float(_cfg(config, "cooldown_seconds"))
     clear_factor = float(_cfg(config, "clear_factor"))
     over_pct = float(_cfg(config, "alert_over_pct"))
     spike_thresh = float(_cfg(config, "spike_pp_per_min"))
+    reset_notify = bool(_cfg(config, "reset_notify"))
+    cap = float(_cfg(config, "over_limit_pct"))
+    reset_drop = float(_cfg(config, "reset_drop_pp"))
+    reset_min_over = float(_cfg(config, "reset_min_over_seconds"))
 
     state = AlertState(now=now, fired_at=fired_at, active=dict(active_prev))
     notifications: list[dict[str, str]] = []
@@ -333,6 +470,18 @@ def evaluate(
     for which in WINDOWS:
         wa = evaluate_window(which, samples, current, config, now)
         state.windows[which] = wa
+
+        # ---- Reset-after-exceeded leg ----------------------------------------
+        # Track the period's peak FRESH used% and watch for a reset (a sharp drop,
+        # or the reset time advancing). Notify on reset ONLY if the just-ended
+        # period reached the cap. The drop test is the reliable signal: Anthropic
+        # may reset usage WITHOUT advancing resets_at (observed), so we cannot rely
+        # on the timestamp alone.
+        _track_reset(
+            which, current, period_prev, state, notifications, now,
+            cap=cap, drop=reset_drop, cooldown=cooldown, notify=reset_notify,
+            min_over=reset_min_over,
+        )
 
         # Two independent condition keys per window: <win>_over, <win>_spike.
         legs = (
@@ -411,6 +560,7 @@ def save_state(state: AlertState) -> None:
         payload = {
             "fired_at": state.fired_at,
             "active": {k: True for k, v in state.active.items() if v},
+            "period": state.period,
             "updated_at": state.now,
         }
         tmp = path.with_suffix(path.suffix + ".tmp")

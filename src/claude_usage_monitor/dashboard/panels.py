@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import math
 import time
 
 import altair as alt
@@ -13,7 +12,6 @@ import streamlit as st
 from . import data, prep
 from .prep import Controls
 from .. import alerts, queries
-from ..forecast import forecast_from_period_start
 
 
 def _render_alert_banner(config: dict, now: float) -> None:
@@ -103,25 +101,13 @@ def render_pace(controls: Controls, config: dict) -> None:
     which = controls.window_focus
     _render_alert_banner(config, time.time())
     series = data.pace_rows(which, controls.window_seconds)
-    st.subheader(f"{which} window — usage stacked by conversation")
     if not series:
         st.info("No pace data in this range yet — the live statusline monitor "
                 "needs to record samples first.")
         return
 
-    # Derive the KPIs from the canonical current reading (max-of-fresh) and a
-    # live projection, so they agree with the chart top instead of reading one
-    # arbitrary interleaved sample.
-    reading = data.current_reading() or {}
-    fc = forecast_from_period_start(
-        reading.get(f"used_pct_{which}"), prep.window_length(config, which),
-        reading.get(f"resets_at_{which}"), time.time())
-    c1, c2, c3 = st.columns([1, 1.4, 1], gap="medium")
-    c1.metric("Current", _pct(fc.current_pct))
-    c2.metric("Projected (worst-case)", _pct(fc.projected_pct))
-    on_pace = fc.on_pace
-    c3.metric("Status",
-              "on pace" if on_pace else ("over budget" if on_pace is False else "—"))
+    # (Current / Projected / Status are already shown in the page-top KPI row,
+    # so the Pace tab goes straight to the charts to avoid the duplication.)
 
     # Keep branch labels fresh during live refresh (throttled to ~15s).
     try:
@@ -132,46 +118,71 @@ def render_pace(controls: Controls, config: dict) -> None:
     win_len = prep.window_length(config, which)
     bucket = prep.pace_bucket_seconds(win_len, series)  # size to the focused window
     smooth = prep.pace_smooth_buckets(bucket)  # ~10-min rolling-average window
-    df = prep.pace_share_frame(series, labels, bucket, smooth_buckets=smooth)
     warn = float(config.get("alerts", {}).get("warn_projected_pct", 90))
+    resets = prep.pace_reset_times(series)
 
-    if df.empty:
+    # LEFT: account-wide worst-case PROJECTION over the focused window — a single
+    # trajectory (not split by conversation).
+    proj = prep.pace_projection_frame(series, bucket, smooth_buckets=smooth)
+
+    # RIGHT: actual fill of the CURRENT 5h window, split by conversation.
+    # Independent of the focused window above: when the focus IS 5h these resolve
+    # to the same cached rows; when it's 7d we still fetch the 5h series so the
+    # fill chart stays 5h-scoped.
+    win_5h = prep.window_length(config, "5h")
+    series_5h = data.pace_rows("5h", controls.window_seconds)
+    resets_5h = prep.pace_reset_times(series_5h)
+    bucket_5h = prep.pace_bucket_seconds(win_5h, series_5h)
+    acc = prep.usage_accumulation_frame(
+        series_5h, labels, bucket_5h, reset_times=resets_5h,
+        current_window_only=True, window_seconds=win_5h,
+    )
+
+    if proj.empty and acc.empty:
         st.caption("Not enough samples yet.")
         return
 
-    resets = prep.pace_reset_times(series)
-    st.altair_chart(_stacked_pace_chart(df, warn, resets), width="stretch")
     avg_min = max(1, round(smooth * bucket / 60))
     reset_note = (
         f" Cyan line{'s' if len(resets) != 1 else ''} mark where the {which} "
         f"window reset." if resets else ""
     )
+
+    # Side-by-side so both charts fit above the fold. Only the right chart is
+    # split by conversation, so its legend is suppressed and drawn once below.
+    left, right = st.columns(2, gap="medium")
+    with left:
+        st.markdown(f"**{which} window — projected usage (worst-case)**")
+        if proj.empty:
+            st.caption("Not enough samples yet.")
+        else:
+            st.altair_chart(
+                _projection_chart(proj, warn, resets), width="stretch")
+    with right:
+        st.markdown("**Total usage — current 5h window fill (%)**")
+        if acc.empty:
+            st.caption("No usage data in this range yet.")
+        else:
+            st.altair_chart(
+                _cumulative_usage_chart(acc, resets_5h, legend=False), width="stretch")
+
+    legend = _shared_conv_legend(acc)
+    if legend is not None:
+        st.altair_chart(legend, width="stretch")
+
     with st.expander("Chart notes"):
         st.caption(
-            f"Account-wide {which}-window used % over time (a rolling metric — it "
-            f"rises and falls as usage ages out), peak per ~{int(bucket)}s bucket "
-            f"then a centered ~{avg_min}-min rolling average. Bands split the used % "
-            f"by the $ each conversation spent (a proxy — the % itself is "
-            f"account-wide). Dashed lines: amber warn {warn:.0f}% and slate ceiling "
-            f"100%.{reset_note}"
+            f"**Left — projected usage.** Account-wide worst-case projection of the "
+            f"{which}-window used % over time: each sample's run-rate forecast to the "
+            f"window end, peak per ~{int(bucket)}s bucket then a centered "
+            f"~{avg_min}-min rolling average. Dashed lines: amber warn {warn:.0f}% "
+            f"and slate ceiling 100%.{reset_note}"
         )
-
-    # Total usage: the current window's rolling fill (0–100 %), reset-scoped.
-    st.subheader(f"Total usage — current {which} window fill (%)")
-    acc = prep.usage_accumulation_frame(
-        series, labels, bucket, reset_times=resets,
-        current_window_only=True, window_seconds=win_len,
-    )
-    if acc.empty:
-        st.caption("No usage data in this range yet.")
-    else:
-        st.altair_chart(_cumulative_usage_chart(acc, resets), width="stretch")
-        with st.expander("Chart notes"):
-            st.caption(
-                f"Current {which} window's fill level (0–100 %): the rolling used % "
-                "since its last reset (rises and falls), split by $ spent per "
-                "conversation. The cyan line marks the window reset."
-            )
+        st.caption(
+            "**Right — total usage.** Current 5h window's fill level (0–100 %): "
+            "the rolling used % since its last reset (rises and falls), split by $ "
+            "spent per conversation. The cyan line marks the window reset."
+        )
 
 
 # A fixed categorical palette; each conversation maps to a slot by a hash of its
@@ -199,18 +210,20 @@ def _color_for(name: str) -> str:
     return _PALETTE[idx]
 
 
-def _conv_color(df):
-    """Color encoding whose legend lists only the conversations PRESENT in df,
-    each with a deterministic (hash-based) color that's stable across refreshes."""
-    legend = alt.Legend(
+def _conv_color(df, *, legend: bool = True):
+    """Color encoding for the conversation field. With legend=False the scale
+    (and thus the colors) is preserved but no legend is drawn, so two charts can
+    share ONE legend rendered separately. Each conversation keeps its
+    deterministic (hash-based) color that's stable across refreshes."""
+    leg = alt.Legend(
         title="conversation", orient="bottom", direction="horizontal",
         columns=4, symbolSize=60, labelFontSize=10, labelLimit=120,
-    )
+    ) if legend else None
     present = sorted(df["conversation"].dropna().unique()) if "conversation" in df else []
     if not present:
-        return alt.Color("conversation:N", legend=legend)
+        return alt.Color("conversation:N", legend=leg)
     return alt.Color(
-        "conversation:N", legend=legend,
+        "conversation:N", legend=leg,
         scale=alt.Scale(domain=present, range=[_color_for(c) for c in present]),
     )
 
@@ -224,6 +237,10 @@ _WARN_COLOR = "#f59e0b"      # amber-500
 _CEILING_COLOR = "#64748b"   # slate-500
 _RESET_COLOR = "#06b6d4"     # cyan-500
 _ANNOTATION = "#cbd5e1"      # slate-300, lifts labels above grid text
+
+# Shared height for the two side-by-side Pace charts: tall enough to fill the
+# viewport once the KPI tiles are compacted, while still fitting without scroll.
+_CHART_H = 400
 
 
 def _time_axis(df) -> alt.Axis:
@@ -246,16 +263,52 @@ def _reset_lines(resets):
     )
 
 
-def _cumulative_usage_chart(df, resets=None):
+def _shared_conv_legend(*frames):
+    """A standalone bottom legend covering every conversation in `frames`, drawn
+    once beneath the two side-by-side charts. Uses the same hash-based colors as
+    the charts, so it is a faithful key for both. Building it from the UNION of
+    the frames matters: the cumulative frame is current-window-only (a subset),
+    so a per-frame legend could omit an entry shown in the stacked chart."""
+    names = sorted({
+        c for f in frames if f is not None and "conversation" in f
+        for c in f["conversation"].dropna().unique()
+    })
+    if not names:
+        return None
+    leg_df = pd.DataFrame({"conversation": names})
+    return (
+        alt.Chart(leg_df)
+        .mark_point(filled=True, size=50, opacity=0)  # invisible marks; legend only
+        .encode(
+            x=alt.value(0), y=alt.value(0),
+            color=alt.Color(
+                "conversation:N",
+                scale=alt.Scale(domain=names, range=[_color_for(c) for c in names]),
+                legend=alt.Legend(
+                    title=None, orient="bottom", direction="horizontal",
+                    columns=6, symbolSize=50, labelFontSize=10, labelLimit=120,
+                    rowPadding=0, padding=2,
+                ),
+            ),
+        )
+        .properties(width="container", height=1)
+    )
+
+
+def _cumulative_usage_chart(df, resets=None, *, legend: bool = True):
+    # Pin x to the current window's own data span so older resets (or sparse
+    # early samples) can't stretch the axis back before this 5h period.
+    x_min, x_max = df["time"].min(), df["time"].max()
     area = (
         alt.Chart(df)
         .mark_area(fillOpacity=0.55, strokeOpacity=0.9, strokeWidth=0.5)
         .encode(
-            x=alt.X("time:T", title=None, axis=_time_axis(df)),
+            x=alt.X("time:T", title=None, axis=_time_axis(df),
+                    scale=alt.Scale(domain=[x_min, x_max], nice=False)),
             y=alt.Y("used_pct:Q", stack=True, title="used %",
                     scale=alt.Scale(domain=[0, 100]),
                     axis=alt.Axis(format="d", tickCount=5)),
-            color=_conv_color(df),
+            color=_conv_color(df, legend=legend),
             tooltip=[
                 alt.Tooltip("time:T", title="time", format="%Y-%m-%d %H:%M"),
                 alt.Tooltip("conversation:N", title="conversation"),
@@ -267,26 +320,32 @@ def _cumulative_usage_chart(df, resets=None):
         strokeDash=[8, 4], color=_CEILING_COLOR
     ).encode(y="y:Q")
     layers = [area, ceiling]
-    if resets:
-        layers.append(_reset_lines(resets))
-    return alt.layer(*layers).properties(width="container", height=240)
+    in_window = [r for r in (resets or []) if x_min <= r <= x_max]
+    if in_window:
+        layers.append(_reset_lines(in_window))
+    return alt.layer(*layers).properties(width="container", height=_CHART_H)
 
 
-def _stacked_pace_chart(df, warn: float, resets=None):
+def _projection_chart(df, warn: float, resets=None):
+    """Account-wide worst-case PROJECTED used % over time — one trajectory (not
+    split by conversation), with the warn and ceiling reference lines."""
+    # Headroom above the data so a projection over 100% stays readable, but cap
+    # it so a freak spike can't flatten the whole series against the floor.
+    top = min(200.0, max(105.0, float(df["projected_pct"].max()) + 5.0))
     area = (
         alt.Chart(df)
-        .mark_area(fillOpacity=0.55, strokeOpacity=0.9, strokeWidth=0.5)
+        .mark_area(
+            color=_ACCENT, fillOpacity=0.18,
+            line={"color": _ACCENT, "strokeWidth": 2},
+        )
         .encode(
             x=alt.X("time:T", title=None, axis=_time_axis(df)),
-            y=alt.Y("share:Q", stack=True, title="used %",
-                    scale=alt.Scale(domain=[0, 105]),
+            y=alt.Y("projected_pct:Q", title="projected %",
+                    scale=alt.Scale(domain=[0, top]),
                     axis=alt.Axis(format="d", tickCount=5)),
-            color=_conv_color(df),
             tooltip=[
                 alt.Tooltip("time:T", title="time", format="%Y-%m-%d %H:%M"),
-                alt.Tooltip("conversation:N", title="conversation"),
-                alt.Tooltip("share:Q", title="$-weighted share of used %",
-                            format=".1f"),
+                alt.Tooltip("projected_pct:Q", title="projected %", format=".0f"),
             ],
         )
     )
@@ -310,7 +369,7 @@ def _stacked_pace_chart(df, warn: float, resets=None):
     layers = [area, warn_rule, ceil_rule, warn_label, ceil_label]
     if resets:
         layers.append(_reset_lines(resets))
-    return alt.layer(*layers).properties(width="container", height=260)
+    return alt.layer(*layers).properties(width="container", height=_CHART_H)
 
 
 def render_usage(controls: Controls, config: dict) -> None:
@@ -330,6 +389,24 @@ def render_usage(controls: Controls, config: dict) -> None:
         st.caption("No cost samples in this range.")
     else:
         st.area_chart(cost, x="time", y="cost_usd", height=220, width="stretch")
+
+    _render_overage(controls, config)
+
+
+def _render_overage(controls: Controls, config: dict) -> None:
+    """Notional $ burned while a window was at/over the limit, for this range."""
+    cap = float(config.get("alerts", {}).get("over_limit_pct", 100.0))
+    o5 = data.overage("5h", controls.window_seconds, cap)
+    o7 = data.overage("7d", controls.window_seconds, cap)
+    st.subheader("💸 Overage — spend while over the limit")
+    st.caption(
+        f"Notional $ (token-cost equivalent) burned while a window was at/over "
+        f"{cap:.0f}% used, within the selected range. Subscription plans don't "
+        f"bill this — it's how much usage you packed in past the cap."
+    )
+    c5, c7 = st.columns(2)
+    c5.metric("5h overage", f"${o5:,.2f}")
+    c7.metric("7d overage", f"${o7:,.2f}")
 
 
 def render_models(controls: Controls, config: dict) -> None:
@@ -405,9 +482,3 @@ def _render_session_detail(gen: str, session_id: str) -> None:
     cost = prep.cost_frame(series)
     if not cost.empty:
         st.area_chart(cost, x="time", y="cost_usd", height=200, width="stretch")
-
-
-def _pct(v) -> str:
-    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
-        return "—"
-    return f"{v:.0f}%"

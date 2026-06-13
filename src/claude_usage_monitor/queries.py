@@ -171,18 +171,92 @@ def latest_sample(*, budget_conn=None) -> dict[str, Any] | None:
             conn.close()
 
 
+def _resolve_window_reading(
+    rows: list[dict],
+    used_col: str,
+    reset_col: str,
+    recent_cut: float,
+    freeze_seconds: float,
+) -> tuple[Any, Any] | None:
+    """Best (used%, resets_at) for one window from interleaved samples.
+
+    ``rows`` is the widened scan (recent + freeze lookback), oldest first.
+
+    The naive "MAX used% among FRESH rows" is robust while the account-wide
+    counter RISES (a lagging session under-reports, so the max is the leading
+    edge) — but it breaks on a RESET: a hung session keeps re-emitting the
+    pre-reset payload (same used%/resets_at, fresh ``ts``), so it passes the
+    ``resets_at > ts`` freshness test and its stale-HIGH value wins the max for as
+    long as it emits (observed ~50 min). So we additionally drop FROZEN sessions —
+    one stuck repeating a single value for >= ``freeze_seconds`` (a hung process,
+    not a live one tracking the account) — and read each LIVE session's LATEST
+    value, then take the max of those. If every session is frozen (a genuinely
+    idle/maxed account, possibly with a lone stuck zombie), fall back to the
+    consensus (lower-median) so one stuck high reading can't dominate.
+
+    Returns ``None`` when no fresh sample exists (caller keeps its fallback).
+    """
+    fresh = [
+        r for r in rows
+        if r.get(used_col) is not None
+        and r.get(reset_col) is not None
+        and r[reset_col] > r["ts"]
+    ]
+    if not fresh:
+        return None
+
+    # Frozen = a session repeating ONE used% across fresh history spanning at least
+    # freeze_seconds. Needs the widened scan to see the constancy. (fresh is asc.)
+    by_session: dict[Any, list[dict]] = {}
+    for r in fresh:
+        by_session.setdefault(r.get("session_id"), []).append(r)
+    frozen = {
+        sid for sid, rs in by_session.items()
+        if len({rr[used_col] for rr in rs}) == 1
+        and (rs[-1]["ts"] - rs[0]["ts"]) >= freeze_seconds
+    }
+
+    # Each session's LATEST fresh reading within the recent snapshot window.
+    latest: dict[Any, dict] = {}
+    for r in fresh:
+        if r["ts"] < recent_cut:
+            continue
+        sid = r.get("session_id")
+        if sid not in latest or r["ts"] >= latest[sid]["ts"]:
+            latest[sid] = r
+    if not latest:  # fresh history exists but nothing in the recent window
+        newest = fresh[-1]
+        return newest[used_col], newest[reset_col]
+
+    live = [r for sid, r in latest.items() if sid not in frozen]
+    if live:
+        best = max(live, key=lambda r: r[used_col])
+        return best[used_col], best[reset_col]
+
+    # All sources frozen: lower-median over per-session-latest, so a single stuck
+    # zombie can't outvote the consensus (e.g. idle right after a reset).
+    ordered = sorted(latest.values(), key=lambda r: r[used_col])
+    pick = ordered[(len(ordered) - 1) // 2]
+    return pick[used_col], pick[reset_col]
+
+
 def current_reading(
-    *, recent_seconds: float = 30.0, budget_conn=None
+    *, recent_seconds: float = 30.0, freeze_seconds: float = 90.0, budget_conn=None
 ) -> dict[str, Any] | None:
-    """A single canonical 'current usage' reading, robust to interleaving.
+    """A single canonical 'current usage' reading, robust to interleaving + resets.
 
     budget.db interleaves concurrent sessions; a single ``ORDER BY ts DESC`` row
-    is a lottery (and may be a stale 'zombie'). Instead, over the most recent
-    ``recent_seconds`` of samples, take the MAX used % among FRESH rows
-    (``resets_at_* > ts``) for each window, with that row's reset time, plus the
-    latest cost/model/effort. This matches the charts' per-bucket max-of-fresh,
-    so the KPIs agree with the chart. Falls back to the latest row if no fresh
-    rows exist.
+    is a lottery (and may be a stale 'zombie'). Over a recent snapshot window
+    (``recent_seconds``) we pick each window's best FRESH (``resets_at_* > ts``)
+    reading via :func:`_resolve_window_reading`, which drops hung/frozen sessions
+    so a post-reset drop is reflected promptly rather than masked by a stuck
+    pre-reset payload. The scan is widened by ``freeze_seconds`` so frozen sessions
+    can be recognized. Cost/model/effort/ts come from the latest row; falls back to
+    that row's values for a window with no fresh sample.
+
+    NOTE: at the exact reset moment this can read lower than the Pace charts (which
+    still take a per-bucket max-of-fresh and so briefly show the lingering zombie
+    band) — the KPI/alert 'current' value is intentionally the fresher of the two.
     """
     conn, own = _open_budget(budget_conn)
     if conn is None:
@@ -191,7 +265,8 @@ def current_reading(
         max_ts_row = conn.execute("SELECT MAX(ts) AS m FROM samples").fetchone()
         if not max_ts_row or max_ts_row["m"] is None:
             return None
-        cutoff = max_ts_row["m"] - recent_seconds
+        max_ts = max_ts_row["m"]
+        cutoff = max_ts - (recent_seconds + freeze_seconds)
         rows = [
             dict(r)
             for r in conn.execute(
@@ -202,20 +277,16 @@ def current_reading(
             return None
 
         out = dict(rows[-1])  # latest row seeds cost/model/effort/ts/session_id
+        recent_cut = max_ts - recent_seconds
         for used_col, reset_col in (
             ("used_pct_5h", "resets_at_5h"),
             ("used_pct_7d", "resets_at_7d"),
         ):
-            fresh = [
-                r for r in rows
-                if r.get(used_col) is not None
-                and r.get(reset_col) is not None
-                and r[reset_col] > r["ts"]
-            ]
-            if fresh:
-                best = max(fresh, key=lambda r: r[used_col])
-                out[used_col] = best[used_col]
-                out[reset_col] = best[reset_col]
+            chosen = _resolve_window_reading(
+                rows, used_col, reset_col, recent_cut, freeze_seconds
+            )
+            if chosen is not None:
+                out[used_col], out[reset_col] = chosen
             # else: leave the latest row's values (graceful fallback)
         return out
     finally:
@@ -253,6 +324,65 @@ def usage_timeseries(
                 (now - window_seconds,),
             ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        if own:
+            conn.close()
+
+
+_OVERAGE_COLS = {
+    "5h": ("used_pct_5h", "resets_at_5h"),
+    "7d": ("used_pct_7d", "resets_at_7d"),
+}
+
+
+def overage_spend_usd(
+    which: str = "7d",
+    *,
+    over_pct: float = 100.0,
+    since: float | None = None,
+    now: float,
+    budget_conn=None,
+) -> float:
+    """Notional $ accrued while the ``which`` window was AT/OVER ``over_pct``.
+
+    ``cost_usd`` is a per-session running total (monotonic), so the spend in an
+    interval is the positive diff of consecutive samples of the SAME session.
+    ``used_pct_*`` is the ACCOUNT-WIDE rolling counter, reported (identically,
+    modulo staleness) by every concurrent session — so each sample's own fresh
+    reading tells us whether the account was over the cap at that moment. We sum
+    each session's positive cost delta only across samples that are FRESH
+    (``reset > ts`` — drops lagging zombie snapshots) and AT/OVER the cap.
+
+    Computed in SQL (one indexed scan + window function) so the statusline can
+    afford it every tick even for the 7d period. ``since`` bounds the scan to the
+    current period start; ``None`` means all history. Returns 0.0 on any miss.
+    """
+    used_col, reset_col = _OVERAGE_COLS.get(which, _OVERAGE_COLS["7d"])
+    conn, own = _open_budget(budget_conn)
+    if conn is None:
+        return 0.0
+    try:
+        where = [
+            "prev IS NOT NULL",
+            f"{used_col} >= ?",
+            f"{reset_col} IS NOT NULL",
+            f"{reset_col} > ts",
+            "cost_usd IS NOT NULL",
+        ]
+        params: list[Any] = [over_pct]
+        ts_filter = ""
+        if since is not None:
+            ts_filter = "WHERE ts >= ?"
+            params.insert(0, since)
+        sql = (
+            f"WITH s AS (SELECT ts, {used_col}, {reset_col}, cost_usd, "
+            f"  LAG(cost_usd) OVER (PARTITION BY session_id ORDER BY ts) AS prev "
+            f"  FROM samples {ts_filter}) "
+            f"SELECT COALESCE(SUM(MAX(cost_usd - prev, 0)), 0) AS overage "
+            f"FROM s WHERE {' AND '.join(where)}"
+        )
+        row = conn.execute(sql, params).fetchone()
+        return float(row["overage"]) if row and row["overage"] is not None else 0.0
     finally:
         if own:
             conn.close()

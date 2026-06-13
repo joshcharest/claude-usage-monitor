@@ -50,6 +50,58 @@ def test_current_reading_falls_back_to_latest_when_all_stale(env):
     assert r is not None and r["used_pct_5h"] == 40.0  # graceful fallback
 
 
+def test_current_reading_drops_frozen_zombie_after_reset(env):
+    now = 1_000_000.0
+    f = int(now + 200000)  # reset time did NOT advance (the observed real case)
+    # Hung session: re-emits used=100 for >90s with fresh ts (passes freshness).
+    for i in range(0, 130, 10):
+        db.ingest(Sample(ts=now - 120 + i, session_id="zombie",
+                         used_pct_7d=100.0, resets_at_7d=f, cost_usd=50.0))
+    # Live session: was at 100, just reset, now climbing from a low base.
+    db.ingest(Sample(ts=now - 25, session_id="live", used_pct_7d=100.0, resets_at_7d=f))
+    db.ingest(Sample(ts=now - 5, session_id="live", used_pct_7d=2.0, resets_at_7d=f))
+    db.ingest(Sample(ts=now - 1, session_id="live", used_pct_7d=3.0, resets_at_7d=f))
+    r = queries.current_reading(recent_seconds=30, freeze_seconds=90)
+    assert r["used_pct_7d"] == 3.0  # live latest, NOT the stuck zombie's 100
+    assert r["resets_at_7d"] == f
+
+
+def test_current_reading_prefers_leading_edge_on_climb(env):
+    now = 1_000_000.0
+    f = int(now + 200000)
+    # No frozen session: max-of-fresh leading edge is preserved (old behavior).
+    db.ingest(Sample(ts=now - 5, session_id="a", used_pct_5h=70.0, resets_at_5h=f))
+    db.ingest(Sample(ts=now - 3, session_id="b", used_pct_5h=72.0, resets_at_5h=f))
+    db.ingest(Sample(ts=now - 1, session_id="a", used_pct_5h=71.0, resets_at_5h=f))
+    r = queries.current_reading(recent_seconds=30, freeze_seconds=90)
+    assert r["used_pct_5h"] == 72.0  # leading edge, not a's lagging latest
+
+
+def test_current_reading_consensus_when_all_frozen(env):
+    now = 1_000_000.0
+    f = int(now + 200000)
+    # Idle after a reset: three live sessions flat-low, one stuck zombie at 100.
+    # All "frozen" (constant) -> consensus median must ignore the lone zombie.
+    for sid, val in [("l1", 2.0), ("l2", 2.0), ("l3", 2.0), ("z", 100.0)]:
+        for i in range(0, 130, 10):
+            db.ingest(Sample(ts=now - 120 + i, session_id=sid,
+                             used_pct_7d=val, resets_at_7d=f))
+    r = queries.current_reading(recent_seconds=30, freeze_seconds=90)
+    assert r["used_pct_7d"] == 2.0
+
+
+def test_current_reading_keeps_genuine_max_when_maxed(env):
+    now = 1_000_000.0
+    f = int(now + 200000)
+    # Genuinely pinned at 100 (not a reset): every session agrees -> still 100.
+    for sid in ("a", "b"):
+        for i in range(0, 130, 10):
+            db.ingest(Sample(ts=now - 120 + i, session_id=sid,
+                             used_pct_7d=100.0, resets_at_7d=f))
+    r = queries.current_reading(recent_seconds=30, freeze_seconds=90)
+    assert r["used_pct_7d"] == 100.0
+
+
 def test_list_conversations_merges_samples(env):
     _add_conversation("s1", title="With samples")
     _add_conversation("s2", title="No samples")
@@ -72,6 +124,53 @@ def test_list_conversations_filters(env):
     assert [r["session_id"] for r in queries.list_conversations(search="bet")] == ["s2"]
     # default order is started_desc
     assert [r["session_id"] for r in queries.list_conversations()] == ["s1", "s2"]
+
+
+def test_overage_spend_sums_over_cap_deltas(env):
+    now = 1_000_000.0
+    f = int(now + 200000)  # future reset => fresh
+    # cost is a per-session running total; only deltas while used>=100 count.
+    db.ingest(Sample(ts=now + 1, session_id="s1", used_pct_7d=50.0, resets_at_7d=f, cost_usd=10.0))
+    db.ingest(Sample(ts=now + 2, session_id="s1", used_pct_7d=100.0, resets_at_7d=f, cost_usd=12.0))  # +2 over
+    db.ingest(Sample(ts=now + 3, session_id="s1", used_pct_7d=100.0, resets_at_7d=f, cost_usd=15.0))  # +3 over
+    db.ingest(Sample(ts=now + 4, session_id="s1", used_pct_7d=30.0, resets_at_7d=f, cost_usd=17.0))  # under, ignored
+    assert queries.overage_spend_usd("7d", now=now + 10) == pytest.approx(5.0)
+
+
+def test_overage_ignores_stale_over_samples(env):
+    now = 1_000_000.0
+    # Over the cap but STALE (reset already past) -> a frozen zombie -> not counted.
+    db.ingest(Sample(ts=now + 1, session_id="z", used_pct_7d=100.0, resets_at_7d=int(now - 1), cost_usd=10.0))
+    db.ingest(Sample(ts=now + 2, session_id="z", used_pct_7d=100.0, resets_at_7d=int(now - 1), cost_usd=20.0))
+    assert queries.overage_spend_usd("7d", now=now + 10) == pytest.approx(0.0)
+
+
+def test_overage_attributes_deltas_per_session(env):
+    now = 1_000_000.0
+    f = int(now + 200000)
+    # Interleaved sessions, both over: deltas must be per-session (LAG partitions),
+    # never (b.cost - a.cost) across the interleave.
+    db.ingest(Sample(ts=now + 1, session_id="a", used_pct_7d=100.0, resets_at_7d=f, cost_usd=100.0))
+    db.ingest(Sample(ts=now + 2, session_id="b", used_pct_7d=100.0, resets_at_7d=f, cost_usd=5.0))
+    db.ingest(Sample(ts=now + 3, session_id="a", used_pct_7d=100.0, resets_at_7d=f, cost_usd=103.0))  # a +3
+    db.ingest(Sample(ts=now + 4, session_id="b", used_pct_7d=100.0, resets_at_7d=f, cost_usd=9.0))  # b +4
+    assert queries.overage_spend_usd("7d", now=now + 10) == pytest.approx(7.0)
+
+
+def test_overage_since_bounds_the_scan(env):
+    now = 1_000_000.0
+    f = int(now + 200000)
+    db.ingest(Sample(ts=now - 100, session_id="s", used_pct_7d=100.0, resets_at_7d=f, cost_usd=10.0))
+    db.ingest(Sample(ts=now - 99, session_id="s", used_pct_7d=100.0, resets_at_7d=f, cost_usd=50.0))  # +40 BEFORE since
+    db.ingest(Sample(ts=now + 1, session_id="s", used_pct_7d=100.0, resets_at_7d=f, cost_usd=60.0))  # first in window: no prev
+    db.ingest(Sample(ts=now + 2, session_id="s", used_pct_7d=100.0, resets_at_7d=f, cost_usd=63.0))  # +3
+    assert queries.overage_spend_usd("7d", since=now, now=now + 10) == pytest.approx(3.0)
+
+
+def test_overage_degrades_when_budget_db_missing(env):
+    assert not db.db_path().exists()
+    assert queries.overage_spend_usd("7d", now=0.0) == 0.0
+    assert not db.db_path().exists()  # read-only: must not create the db
 
 
 def test_pace_timeseries_matches_forecast(env):

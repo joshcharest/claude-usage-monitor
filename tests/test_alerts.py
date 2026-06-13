@@ -19,6 +19,9 @@ CONFIG = {
         "spike_min_points": 4,
         "cooldown_seconds": 1800.0,
         "clear_factor": 0.9,
+        # 0 = disable the sustained-over guard for the basic reset tests; a
+        # dedicated test exercises the guard with a realistic value.
+        "reset_min_over_seconds": 0.0,
     },
 }
 
@@ -197,6 +200,109 @@ def test_hysteresis_latches_until_below_clear_level():
     prior2 = {"fired_at": s2.fired_at, "active": s2.active}
     s3 = alerts.evaluate([], low, CONFIG, NOW, prior=prior2)
     assert not s3.active.get("5h_over")
+
+
+# --------------------------------------------------- reset-after-exceeded leg
+
+
+def _prior(state):
+    return {"fired_at": state.fired_at, "active": state.active, "period": state.period}
+
+
+def test_reset_notifies_only_after_exceeded():
+    # Build up to the cap, then a sharp collapse on the next tick = reset.
+    over = {"used_pct_5h": 100.0, "resets_at_5h": RESET_5H}
+    s1 = alerts.evaluate([], over, CONFIG, NOW, prior={})
+    assert s1.period["5h"]["peak"] == 100.0
+    assert "5h_reset" not in {n["key"] for n in s1.notifications}
+
+    low = {"used_pct_5h": 3.0, "resets_at_5h": RESET_5H}
+    s2 = alerts.evaluate([], low, CONFIG, NOW + 5, prior=_prior(s1))
+    assert "5h_reset" in {n["key"] for n in s2.notifications}
+    assert s2.period["5h"]["peak"] == 3.0  # peak re-baselines to the post-reset level
+
+
+def test_reset_silent_when_never_exceeded():
+    # Peaks at 60 (< cap), then collapses: a reset, but NOT after an over-period.
+    mid = {"used_pct_5h": 60.0, "resets_at_5h": RESET_5H}
+    s1 = alerts.evaluate([], mid, CONFIG, NOW, prior={})
+    low = {"used_pct_5h": 2.0, "resets_at_5h": RESET_5H}
+    s2 = alerts.evaluate([], low, CONFIG, NOW + 5, prior=_prior(s1))
+    assert "5h_reset" not in {n["key"] for n in s2.notifications}
+
+
+def test_reset_ignores_gradual_rolling_decline():
+    # The 7d counter ages out gradually; small per-tick drops must never read as a
+    # reset, even after the period was over the cap.
+    prior: dict = {}
+    used, now, fired = 100.0, NOW, False
+    for _ in range(11):  # 100 -> 50 in 5-pp steps (each < reset_drop_pp=40)
+        st = alerts.evaluate([], {"used_pct_5h": used, "resets_at_5h": RESET_5H},
+                             CONFIG, now, prior=prior)
+        fired = fired or "5h_reset" in {n["key"] for n in st.notifications}
+        prior, used, now = _prior(st), used - 5.0, now + 60
+    assert fired is False
+
+
+def test_reset_detected_on_reset_time_advance():
+    # Zombie pins used% at 100 (no collapse), but the reset time jumps forward >1h.
+    c1 = {"used_pct_5h": 100.0, "resets_at_5h": NOW + 1000}
+    s1 = alerts.evaluate([], c1, CONFIG, NOW, prior={})
+    c2 = {"used_pct_5h": 100.0, "resets_at_5h": NOW + 1000 + 7200}
+    s2 = alerts.evaluate([], c2, CONFIG, NOW + 5, prior=_prior(s1))
+    assert "5h_reset" in {n["key"] for n in s2.notifications}
+
+
+def test_reset_respects_cooldown():
+    over = {"used_pct_5h": 100.0, "resets_at_5h": RESET_5H}
+    s1 = alerts.evaluate([], over, CONFIG, NOW, prior={})
+    s2 = alerts.evaluate([], {"used_pct_5h": 3.0, "resets_at_5h": RESET_5H},
+                         CONFIG, NOW + 5, prior=_prior(s1))
+    assert "5h_reset" in {n["key"] for n in s2.notifications}
+    # Exceed and collapse again within the cooldown -> no second notification.
+    s3 = alerts.evaluate([], over, CONFIG, NOW + 10, prior=_prior(s2))
+    s4 = alerts.evaluate([], {"used_pct_5h": 3.0, "resets_at_5h": RESET_5H},
+                         CONFIG, NOW + 15, prior=_prior(s3))
+    assert "5h_reset" not in {n["key"] for n in s4.notifications}
+
+
+def test_reset_suppresses_transient_over_blip():
+    # With a realistic sustained-over guard, a one-tick blip back to the cap (a
+    # hung session momentarily winning the reading) must NOT trigger a reset.
+    cfg = {**CONFIG, "alerts": {**CONFIG["alerts"], "reset_min_over_seconds": 300.0}}
+    cooldown = CONFIG["alerts"]["cooldown_seconds"]
+
+    # Sustained over-cap (>300s), then a drop -> genuine reset fires.
+    prior: dict = {}
+    t = NOW
+    for dt in (0, 400):  # over the cap, spanning > min_over
+        st = alerts.evaluate([], {"used_pct_5h": 100.0, "resets_at_5h": RESET_5H},
+                             cfg, t + dt, prior=prior)
+        prior = _prior(st)
+    t += 405
+    st = alerts.evaluate([], {"used_pct_5h": 3.0, "resets_at_5h": RESET_5H},
+                         cfg, t, prior=prior)
+    assert "5h_reset" in {n["key"] for n in st.notifications}
+    prior = _prior(st)
+
+    # Move past cooldown so it can't be what suppresses the next one.
+    t += cooldown + 100
+    # One-tick blip back to 100, then drop again -> NOT sustained -> suppressed.
+    st = alerts.evaluate([], {"used_pct_5h": 100.0, "resets_at_5h": RESET_5H},
+                         cfg, t, prior=prior)
+    prior = _prior(st)
+    st = alerts.evaluate([], {"used_pct_5h": 1.0, "resets_at_5h": RESET_5H},
+                         cfg, t + 5, prior=prior)
+    assert "5h_reset" not in {n["key"] for n in st.notifications}
+
+
+def test_reset_state_survives_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_ALERT_STATE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("CLAUDE_ALERT_NO_NOTIFY", "1")
+    over = {"used_pct_5h": 100.0, "resets_at_5h": RESET_5H}
+    alerts.run_tick([], over, CONFIG, NOW)
+    loaded = alerts.load_state()
+    assert loaded["period"]["5h"]["peak"] == 100.0
 
 
 def test_empty_inputs_produce_no_alerts():
