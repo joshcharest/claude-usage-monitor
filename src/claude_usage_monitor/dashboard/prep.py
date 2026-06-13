@@ -134,11 +134,13 @@ def window_position(
 
 
 def build_kpis(latest: dict | None, config: dict, now: float) -> list[Kpi]:
-    """Top-of-page KPI metrics from the latest sample + projections."""
+    """Top-of-page KPIs: a 5h trio then a 7d trio (Used / Projected / Time left)."""
     warn = float(_cfg(config, "alerts", "warn_projected_pct", default=90.0))
     if not latest:
-        return [Kpi("5h used", "—"), Kpi("7d used", "—"), Kpi("Projected", "—"),
-                Kpi("Session $", "—"), Kpi("Active", "no samples yet")]
+        return [
+            Kpi("5 Hour Used", "—"), Kpi("5 Hour Projected", "—"), Kpi("Time Left", "—"),
+            Kpi("7 Day Used", "—"), Kpi("7 Day Projected", "—"), Kpi("Time Left", "—"),
+        ]
 
     fc5 = forecast_from_period_start(
         latest.get("used_pct_5h"), window_length(config, "5h"),
@@ -150,34 +152,27 @@ def build_kpis(latest: dict | None, config: dict, now: float) -> list[Kpi]:
     def pct(v):
         return f"{v:.0f}%" if v is not None else "—"
 
-    def proj_delta(fc):
-        # st.metric only color-maps "normal"/"inverse" when it can parse a +/-
-        # sign from the delta string; these status strings have none, so we use
-        # the explicit named colors (Streamlit >=1.58) which apply uncondition-
-        # ally. Trending up = caution (orange); trending down/flat = green.
-        if fc.projected_pct is None or fc.current_pct is None:
+    def proj_status(fc):
+        # Named colors apply unconditionally (Streamlit >=1.58); st.metric only
+        # sign-colors deltas it can parse a +/- from, which these status strings
+        # lack. Over the warn threshold = caution (red); otherwise on pace (green).
+        if fc.projected_pct is None:
             return None, "off"
-        trending_up = fc.projected_pct >= fc.current_pct
-        return f"proj {fc.projected_pct:.0f}%", ("orange" if trending_up else "green")
+        over = fc.projected_pct >= warn
+        return ("over budget" if over else "on pace"), ("red" if over else "green")
 
-    d5, c5 = proj_delta(fc5)
-    d7, c7 = proj_delta(fc7)
-    cost = latest.get("cost_usd")
-    model = latest.get("model") or "—"
-    effort = latest.get("effort")
-    active = f"{model}" + (f" · {effort}" if effort else "")
-    reset5 = fmt_duration(fc5.secs_to_reset)
-    over = (fc5.projected_pct or 0) >= warn
+    s5, k5 = proj_status(fc5)
+    s7, k7 = proj_status(fc7)
 
     return [
-        Kpi("5h used", pct(fc5.current_pct), d5, c5, f"resets in {reset5}"),
-        Kpi("7d used", pct(fc7.current_pct), d7, c7,
-            f"resets in {fmt_duration(fc7.secs_to_reset)}"),
-        Kpi("Projected 5h", pct(fc5.projected_pct),
-            "over budget" if over else "on pace",
-            "red" if over else "green"),
-        Kpi("Session $", f"${cost:.2f}" if isinstance(cost, (int, float)) else "—"),
-        Kpi("Active", active, f"5h resets in {reset5}"),
+        Kpi("5 Hour Used", pct(fc5.current_pct)),
+        Kpi("5 Hour Projected", pct(fc5.projected_pct), s5, k5),
+        Kpi("Time Left", fmt_duration(fc5.secs_to_reset),
+            help="until the 5h window resets"),
+        Kpi("7 Day Used", pct(fc7.current_pct)),
+        Kpi("7 Day Projected", pct(fc7.projected_pct), s7, k7),
+        Kpi("Time Left", fmt_duration(fc7.secs_to_reset),
+            help="until the 7d window resets"),
     ]
 
 
@@ -428,6 +423,38 @@ def usage_accumulation_frame(
         if cutoff is not None:
             long = long[long["time"] >= cutoff]
     return long[_USAGE_COLS]
+
+
+_PROJ_COLS = ["time", "projected_pct"]
+
+
+def pace_projection_frame(
+    series: list[dict],
+    bucket_seconds: float | None = None,
+    smooth_buckets: int = 1,
+) -> pd.DataFrame:
+    """Account-wide worst-case PROJECTED used % over time — a single trajectory.
+
+    Uses the same freshness/bucketing as :func:`pace_share_frame` but tracks the
+    forecast (``projected_pct``) rather than realized usage and does NOT split by
+    conversation: the projection is an account-wide figure. Per bucket we take the
+    MAX over fresh samples, then optionally a centered rolling mean. Returns
+    long-format ``(time, projected_pct)``.
+    """
+    df = _bucketed(series, None, bucket_seconds)
+    if df.empty or "projected_pct" not in df.columns:
+        return pd.DataFrame(columns=_PROJ_COLS)
+    df = df.copy()
+    df["projected_pct"] = pd.to_numeric(df["projected_pct"], errors="coerce")
+    df = df.dropna(subset=["projected_pct"])
+    if df.empty:
+        return pd.DataFrame(columns=_PROJ_COLS)
+    peak = df.groupby("bucket")["projected_pct"].max().sort_index()
+    if smooth_buckets and smooth_buckets > 1:
+        peak = peak.rolling(int(smooth_buckets), center=True, min_periods=1).mean()
+    out = peak.reset_index()
+    out.columns = _PROJ_COLS
+    return out[_PROJ_COLS]
 
 
 def model_frame(rows: list[dict]) -> pd.DataFrame:

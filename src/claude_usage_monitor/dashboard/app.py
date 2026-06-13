@@ -52,7 +52,7 @@ st.markdown(
       }
 
       /* Reclaim default top padding; hide chrome (deliberate). */
-      .block-container { padding-top: 1.1rem; padding-bottom: 1.4rem; max-width: 1500px; }
+      .block-container { padding-top: 1.1rem; padding-bottom: 1.4rem; max-width: 1700px; }
       [data-testid="stHeader"] { display: none; }
       [data-testid="stToolbar"] { display: none; }
       [data-testid="stDecoration"] { display: none; }
@@ -82,7 +82,7 @@ st.markdown(
         background: var(--km-surface);
         border: 1px solid var(--km-border);
         border-radius: var(--km-radius-chip);
-        padding: 12px 16px;
+        padding: 6px 14px;
         box-shadow: var(--km-shadow);
         transition: background 120ms ease, transform 120ms ease;
       }
@@ -92,7 +92,10 @@ st.markdown(
       }
       [data-testid="stMetricLabel"] { opacity: 0.85; }
       [data-testid="stMetricLabel"] p { color: var(--km-text-muted); font-weight: 500; }
-      [data-testid="stMetricValue"] { color: var(--km-text-strong); font-weight: 650; }
+      [data-testid="stMetricValue"] {
+        color: var(--km-text-strong); font-weight: 650;
+        font-size: 1.55rem; line-height: 1.15;
+      }
 
       /* In-tab context KPIs (e.g. the Pace Current/Projected/Status row) get an
          accent left-rail so the eye ties them to the chart that follows. */

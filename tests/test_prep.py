@@ -58,8 +58,11 @@ def test_controls_window_seconds():
 
 def test_build_kpis_empty():
     kpis = prep.build_kpis(None, load_config(), now=0.0)
-    assert [k.label for k in kpis][:2] == ["5h used", "7d used"]
-    assert all(k.value in ("—", "no samples yet") for k in kpis)
+    assert [k.label for k in kpis] == [
+        "5 Hour Used", "5 Hour Projected", "Time Left",
+        "7 Day Used", "7 Day Projected", "Time Left",
+    ]
+    assert all(k.value == "—" for k in kpis)
 
 
 def test_build_kpis_with_sample():
@@ -74,11 +77,16 @@ def test_build_kpis_with_sample():
         "model": "claude-opus-4-8",
         "effort": "high",
     }
-    kpis = {k.label: k for k in prep.build_kpis(latest, config, now)}
-    assert kpis["5h used"].value == "30%"
-    assert kpis["Projected 5h"].value == "60%"
-    assert kpis["Session $"].value == "$12.34"
-    assert "claude-opus-4-8" in kpis["Active"].value
+    kpis = prep.build_kpis(latest, config, now)
+    # Six tiles in order: 5h trio then 7d trio.
+    assert [k.label for k in kpis] == [
+        "5 Hour Used", "5 Hour Projected", "Time Left",
+        "7 Day Used", "7 Day Projected", "Time Left",
+    ]
+    assert kpis[0].value == "30%"      # 5 Hour Used
+    assert kpis[1].value == "60%"      # 5 Hour Projected (half-elapsed -> 60%)
+    assert kpis[2].value == "2h30m"    # Time Left until 5h reset (9000 s)
+    assert kpis[3].value == "40%"      # 7 Day Used
 
 
 def test_usage_frame_long_format():
