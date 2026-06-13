@@ -1,5 +1,7 @@
 """Unit tests for the pure budget-burndown forecaster."""
 
+import pytest
+
 from claude_usage_monitor.config import load_config
 from claude_usage_monitor.forecast import (
     ForecastCfg,
@@ -305,10 +307,13 @@ def test_forecast_window_7d_mean_reverts_live_blip():
     assert fc.method in ("additive", "decay_sim")
 
 
-def test_forecast_window_7d_steady_decay_holds_below_additive():
-    # 7d steady user with cost history spanning the window: roll-off of past usage
-    # offsets future additions, so the decay sim projects BELOW the additive
-    # value-at-reset that ignores roll-off (the dominant 7d over-projection fix).
+def test_forecast_window_7d_fixed_window_no_inwindow_rolloff():
+    # Anthropic's 7d limit is a FIXED window: used_pct accumulates from window-open
+    # (reset - W) and drops only at the hard reset — it does NOT continuously roll
+    # off. So even with steady cost history spanning a full window back, NONE of it
+    # ages off before the reset (every roll-off lookup floors at window-open), and
+    # the decay sim must project the SAME as the additive value-at-reset rather than
+    # subtracting phantom roll-off from a prior, already-reset window.
     now = 5_000_000.0
     secs_to_reset = WINDOW_7D * 0.5
     resets = now + secs_to_reset
@@ -323,8 +328,9 @@ def test_forecast_window_7d_steady_decay_holds_below_additive():
         cur, resets, now, WINDOW_7D, fresh_samples=fresh,
         cost_rows=[], which="7d", cfg=cfg,
     )
-    # Steady spend spanning the whole window back to now-W, co-moving with used%
-    # so it calibrates and supplies a real roll-off profile.
+    # Steady spend spanning the whole window back to now-W, co-moving with used%.
+    # The calibration still fires (method == decay_sim), but the roll-off term is
+    # inert inside a fixed window, so the projection is unchanged.
     cost = []
     c = 0.0
     t = now - WINDOW_7D
@@ -337,7 +343,7 @@ def test_forecast_window_7d_steady_decay_holds_below_additive():
         cost_rows=cost, which="7d", cfg=cfg,
     )
     assert fc_decay.method == "decay_sim"
-    assert fc_decay.projected_pct < fc_add.projected_pct
+    assert fc_decay.projected_pct == pytest.approx(fc_add.projected_pct)
 
 
 def test_forecast_window_decay_lowers_front_loaded_5h():

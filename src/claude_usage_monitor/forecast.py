@@ -475,26 +475,36 @@ def _simulate_peak(
     window_length: float,
     steps: int,
 ) -> float:
-    """Peak rolling used% over ``[now, reset]`` from additions MINUS roll-off.
+    """Peak used% over ``[now, reset]`` from additions MINUS in-window roll-off.
 
-    The rolling metric evolves as ``dU/dt = additions(t) - decay(t)`` where what ages
-    off the back at future time ``t`` is exactly what was added at ``t - window`` —
-    already in the PAST and observable via the calibrated ``cum_at``. So::
+    Anthropic's 5h and 7d limits are FIXED windows: ``used_pct`` accumulates
+    monotonically from when the window opens (``reset - W``) and drops to ~0 only at
+    the hard reset — it does NOT continuously roll off. So usage that ages past
+    ``window`` only counts as roll-off if it was added *inside the current window*;
+    anything older belongs to a window that already reset and must not be subtracted
+    (subtracting it reaches across the reset boundary into prior spend and pins the
+    projection at ``current`` — the phantom-roll-off bug). We therefore floor every
+    decay lookup at the window-open time ``open = reset - W``::
 
-        U(t) = current + future_fn(t-now) - (cum_at(t-W) - cum_at(now-W))
+        U(t) = current + future_fn(t-now) - (cum_at(t-W) - cum_at(now-W)), lookups >= open
 
-    The throttle is peak-driven, so we walk ``steps`` points to ``reset`` and return
-    the max U (>= current). With no calibrated history ``cum_at`` is 0 everywhere, so
-    the decay term vanishes and this degrades to the additive value-at-reset.
+    Because ``now + dt - W <= reset - W = open`` for every ``dt <= secs_to_reset``,
+    a fixed window has no in-window roll-off before its reset, so this correctly
+    degrades to the additive value-at-reset; the clamp keeps the formula honest if a
+    window ever rolls genuinely. The throttle is peak-driven, so we walk ``steps``
+    points to ``reset`` and return the max U (>= current).
     """
     if secs_to_reset <= 0:
         return current_pct
     steps = max(1, int(steps))
-    base_decay = cum_at(now - window_length)
+    # Current window opened here; never subtract additions from before it (they
+    # belong to a window that already hard-reset).
+    window_open = now + secs_to_reset - window_length
+    base_decay = cum_at(max(now - window_length, window_open))
     peak = current_pct
     for i in range(1, steps + 1):
         dt = secs_to_reset * (i / steps)
-        rolled_off = max(0.0, cum_at(now + dt - window_length) - base_decay)
+        rolled_off = max(0.0, cum_at(max(now + dt - window_length, window_open)) - base_decay)
         u = current_pct + future_fn(dt) - rolled_off
         if u > peak:
             peak = u
