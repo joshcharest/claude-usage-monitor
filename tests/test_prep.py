@@ -204,6 +204,25 @@ def test_usage_accumulation_current_window_only():
     assert df["used_pct"].sum() == pytest.approx(10.0)
 
 
+def test_usage_accumulation_ignores_future_reset_boundary():
+    # A flaky/advanced resets_at can yield a reset boundary AFTER all the data.
+    # It must not be used as the current-window start (that would clip everything
+    # away and blank the chart). Fall back to the most recent PAST reset.
+    series = [
+        {"ts": 0.0, "session_id": "s1", "used_pct": 50.0},   # pre-reset
+        {"ts": 70.0, "session_id": "s1", "used_pct": 10.0},  # current window
+    ]
+    past = prep.to_local([35.0])[0]
+    future = prep.to_local([10_000.0])[0]  # well beyond the data
+    df = prep.usage_accumulation_frame(
+        series, {}, bucket_seconds=60, reset_times=[past, future],
+        current_window_only=True, window_seconds=18000.0,
+    )
+    assert not df.empty
+    assert df["time"].nunique() == 1
+    assert df["used_pct"].sum() == pytest.approx(10.0)
+
+
 def test_usage_accumulation_empty():
     df = prep.usage_accumulation_frame([])
     assert list(df.columns) == ["time", "conversation", "used_pct"]

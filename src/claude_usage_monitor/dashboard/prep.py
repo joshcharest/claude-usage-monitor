@@ -397,8 +397,11 @@ def usage_accumulation_frame(
     Same peak-of-fresh + cost-weighted split as :func:`pace_share_frame`, but the
     value is the window's actual rolling fill (it rises AND falls — no high-water
     latch). ``current_window_only`` clips to the current window: buckets at/after
-    the most recent ``reset_times`` boundary, or the last ``window_seconds`` if no
-    reset was detected. Returns long-format ``(time, conversation, used_pct)``.
+    the most recent reset boundary that has ALREADY occurred, or the last
+    ``window_seconds`` if no past reset was detected. A boundary in the future
+    (flaky/advanced ``resets_at`` data) is ignored — it can't start the current
+    window, and using it would clip the whole series away (empty chart). Returns
+    long-format ``(time, conversation, used_pct)``.
     """
     df = _bucketed(series, labels, bucket_seconds)
     if df.empty:
@@ -414,12 +417,17 @@ def usage_accumulation_frame(
     )
 
     if current_window_only and not long.empty:
-        reset_vals = sorted(pd.Timestamp(t) for t in (reset_times or []))
+        data_max = long["time"].max()
+        # Only a reset that has already happened (<= the latest data) can mark the
+        # start of the CURRENT window; a future boundary is a prediction/artifact.
+        past_resets = sorted(
+            r for r in (pd.Timestamp(t) for t in (reset_times or [])) if r <= data_max
+        )
         cutoff = None
-        if reset_vals:
-            cutoff = reset_vals[-1]
+        if past_resets:
+            cutoff = past_resets[-1]
         elif window_seconds:
-            cutoff = long["time"].max() - pd.Timedelta(seconds=float(window_seconds))
+            cutoff = data_max - pd.Timedelta(seconds=float(window_seconds))
         if cutoff is not None:
             long = long[long["time"] >= cutoff]
     return long[_USAGE_COLS]
