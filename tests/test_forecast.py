@@ -420,7 +420,8 @@ def test_forecast_config_keys_have_documented_defaults():
     assert fc["burst_horizon_seconds"] == 2700
     assert fc["revert_tau_seconds"] == 3600
     assert fc["idle_seconds"] == 600
-    assert fc["revert_tau_7d_seconds"] == 172800
+    assert fc["burst_horizon_7d_seconds"] == 10800
+    assert fc["revert_tau_7d_seconds"] == 3600
     assert fc["decay_bucket_seconds"] == 900
     assert fc["decay_sim_steps"] == 24
     assert fc["band_frac"] == 0.25
@@ -430,7 +431,8 @@ def test_forecast_config_keys_have_documented_defaults():
     assert cfg.slope_window_seconds == 1800.0
     assert cfg.slope_min_points == 4
     assert cfg.burst_horizon_seconds == 2700.0
-    assert cfg.revert_tau_7d_seconds == 172800.0
+    assert cfg.revert_tau_7d_seconds == 3600.0
+    assert cfg.burst_horizon_7d_seconds == 10800.0
     assert cfg.decay_sim_steps == 24
 
 

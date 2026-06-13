@@ -426,47 +426,79 @@ def pace_timeseries(
     rows = usage_timeseries(window_seconds, now=now, budget_conn=budget_conn)
     layered = model_is_layered(config)
     cfg = ForecastCfg.from_config(config) if layered else None
-    # A rolling trailing buffer (raw rows within ~one window) walked oldest->newest
-    # so each row's forecast sees only its own trailing history — exactly what the
-    # live statusline would have had AT that sample's instant. On thin history
-    # forecast_window falls back to the ratio model, so a single early row
-    # reproduces the legacy number (test_pace_timeseries_matches_forecast).
-    buf: list[dict] = []
 
-    out = []
-    for row in rows:
+    # Ratio model: O(1) per row, so project every sample directly.
+    if not (layered and cfg is not None):
+        return [
+            _pace_row(row, forecast_from_period_start(
+                row[used_col], length, row[reset_col], row["ts"]), used_col, reset_col)
+            for row in rows
+        ]
+
+    # Layered model: forecast_window is far heavier (slope fit + roll-off sim), so
+    # computing it for every one of potentially tens of thousands of raw samples is
+    # what made the Pace tabs slow. The chart only renders ~150 points, so evaluate
+    # the projection at a bounded, evenly-spaced set of rows (always including the
+    # last, the live one) and leave projected_* None elsewhere — pace_projection_frame
+    # drops the nulls. used_pct / cost ride on EVERY row so the accumulation chart
+    # keeps full resolution. Each forecast sees only its own trailing slope window, a
+    # cheap O(slope-rows) buffer obtained by sliding a `lo` pointer. The roll-off
+    # DECAY needs history reaching back one full window, which the slope buffer
+    # doesn't have — so without it the 7d projection over-projects to the cap. We
+    # avoid the per-point O(window) cost by precomputing ONE global calibrated
+    # cumulative-additions lookup over window-spanning history and injecting it.
+    from .forecast import build_decay_cum, window_inputs  # local: avoids top-level churn
+
+    # Window-spanning rows for the decay cum (independent of the display range, so a
+    # short range on the 7d tab still gets a full week of roll-off history).
+    if window_seconds is not None and window_seconds < length:
+        cum_rows = usage_timeseries(length, now=now, budget_conn=budget_conn)
+    else:
+        cum_rows = rows
+    decay_cum = build_decay_cum(cum_rows, which, now, cfg)
+
+    n = len(rows)
+    step = max(1, (n + _PACE_MAX_FORECASTS - 1) // _PACE_MAX_FORECASTS)
+    slope_w = cfg.slope_window_seconds
+    out: list[dict[str, Any]] = []
+    lo = 0
+    for i, row in enumerate(rows):
         ts = row["ts"]
-        if layered and cfg is not None:
-            from .forecast import window_inputs  # local: avoids top-level churn
-
-            buf.append(row)
-            # Keep ~one full window of trailing rows: the slope fit filters to its
-            # own window internally, while the roll-off decay needs history reaching
-            # back ~`length` so the chart's projection matches the live statusline.
-            cutoff = ts - length
-            if buf and buf[0]["ts"] < cutoff:
-                buf = [r for r in buf if r["ts"] >= cutoff]
-            fresh, cost = window_inputs(buf, which, ts, cfg)
+        while lo < i and rows[lo]["ts"] < ts - slope_w:
+            lo += 1
+        if i % step == 0 or i == n - 1:
+            fresh, cost = window_inputs(rows[lo : i + 1], which, ts, cfg)
             fc = forecast_window(
                 row[used_col], row[reset_col], ts, length,
                 fresh_samples=fresh, cost_rows=cost, which=which, cfg=cfg,
+                decay_cum=decay_cum,
             )
+            out.append(_pace_row(row, fc, used_col, reset_col))
         else:
-            fc = forecast_from_period_start(row[used_col], length, row[reset_col], ts)
-        out.append(
-            {
-                "ts": ts,
-                "session_id": row.get("session_id"),
-                "used_pct": fc.current_pct,
-                "projected_pct": fc.projected_pct,
-                "projected_low": fc.projected_low,
-                "projected_high": fc.projected_high,
-                "on_pace": fc.on_pace,
-                "reset_at": row[reset_col],
-                "cost_usd": row.get("cost_usd"),
-            }
-        )
+            out.append(_pace_row(row, None, used_col, reset_col))
     return out
+
+
+# Cap on how many (expensive) layered forecasts pace_timeseries computes across the
+# range; the chart downsamples to ~150 points, so a few hundred evaluations is ample
+# while keeping the tab responsive over tens of thousands of raw samples.
+_PACE_MAX_FORECASTS = 400
+
+
+def _pace_row(row, fc, used_col, reset_col) -> dict[str, Any]:
+    """One pace output row. ``fc`` None = a non-evaluated row (projection omitted);
+    used_pct / cost still ride along so the accumulation chart stays full-resolution."""
+    return {
+        "ts": row["ts"],
+        "session_id": row.get("session_id"),
+        "used_pct": fc.current_pct if fc is not None else row.get(used_col),
+        "projected_pct": fc.projected_pct if fc is not None else None,
+        "projected_low": fc.projected_low if fc is not None else None,
+        "projected_high": fc.projected_high if fc is not None else None,
+        "on_pace": fc.on_pace if fc is not None else None,
+        "reset_at": row[reset_col],
+        "cost_usd": row.get("cost_usd"),
+    }
 
 
 def session_labels(*, index_conn=None) -> dict[str, str]:

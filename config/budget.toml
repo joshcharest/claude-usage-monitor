@@ -79,9 +79,12 @@ revert_tau_seconds = 3600
 # If no fresh sample (or no recent spend) within this many seconds, treat the
 # account as idle and set the future rate to 0 (project flat).
 idle_seconds = 600
-# 7d: time-constant (sec, 2 days) for mean-reverting the live rate toward its
-# recent baseline over the long horizon, so a live blip fades across the week.
-revert_tau_7d_seconds = 172800
+# 7d: a 30-min slope can't predict a week. Hold the live rate only this long (a
+# few hours), then decay it to zero with the short time-constant below, so a recent
+# burst adds a few hours of usage rather than days. The 7d figure then comes from
+# current usage +/- roll-off (the robust signal at the weekly timescale).
+burst_horizon_7d_seconds = 10800
+revert_tau_7d_seconds = 3600
 # L2 roll-off decay: coarse-bucket the window-spanning cost history to this
 # resolution for the aging profile, and walk the forward peak sim in this many
 # steps from now -> reset.

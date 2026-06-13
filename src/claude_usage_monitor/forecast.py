@@ -14,7 +14,8 @@ Two models live here:
       L1 (additive)   projected = current + recent_rate * secs_to_reset
       L3 (predictor)  the rate over the REST of the window is not flat — 5h
                       mean-reverts a bursty live slope over a burst horizon; 7d
-                      reverts the live rate toward its recent baseline over days.
+                      holds it a few hours then decays to zero (a 30-min slope
+                      can't predict a week), leaning on current ± roll-off.
       L2 (decay sim)  the rolling metric also DECAYS as past usage ages off the
                       back; what rolls off at future t is what was added at t-W,
                       already observable. We simulate U(t)=current+additions-rolloff
@@ -136,9 +137,7 @@ def forecast_from_period_start(
 # Layered model (forecast_window) — primary projector.
 #
 # The whole section below is PURE: callers fetch samples and pass plain lists
-# of ``(ts, value)`` tuples. No DB, no clock, no tz. The hour-of-week bucketing
-# for the 7d profile is computed from raw epoch seconds with a configurable
-# offset so the module stays tz-free (callers pass their local offset in).
+# of ``(ts, value)`` tuples plus a ForecastCfg. No DB, no clock, no tz.
 # ===========================================================================
 
 
@@ -159,10 +158,11 @@ class ForecastCfg:
     burst_horizon_seconds: float = 2700.0
     revert_tau_seconds: float = 3600.0
     idle_seconds: float = 600.0
-    # 7d mean-reversion: the live rate reverts toward the recent baseline rate with
-    # this time-constant (default 2 days) over the long horizon, so a live blip
-    # fades rather than extrapolating flat across the whole week.
-    revert_tau_7d_seconds: float = 172800.0
+    # 7d: hold the live rate only this long (a few hours) before decaying it to
+    # zero — a 30-min slope can't predict a week, so a recent burst contributes a
+    # few hours of additions, not days.
+    burst_horizon_7d_seconds: float = 10800.0
+    revert_tau_7d_seconds: float = 3600.0
     # L2 decay simulation: coarse-bucket the window-spanning cost history to this
     # resolution for the roll-off profile, and walk the forward sim in this many
     # steps from now->reset (peak detection granularity).
@@ -188,7 +188,8 @@ class ForecastCfg:
             burst_horizon_seconds=g("burst_horizon_seconds", 2700.0),
             revert_tau_seconds=g("revert_tau_seconds", 3600.0),
             idle_seconds=g("idle_seconds", 600.0),
-            revert_tau_7d_seconds=g("revert_tau_7d_seconds", 172800.0),
+            burst_horizon_7d_seconds=g("burst_horizon_7d_seconds", 10800.0),
+            revert_tau_7d_seconds=g("revert_tau_7d_seconds", 3600.0),
             decay_bucket_seconds=g("decay_bucket_seconds", 900.0),
             decay_sim_steps=int(g("decay_sim_steps", 24)),
             band_frac=g("band_frac", 0.25),
@@ -232,9 +233,8 @@ def _recent_rate_pp_per_sec(
 def _positive_deltas(series: list[tuple[float, float]]) -> list[tuple[float, float]]:
     """``(ts, increment)`` for each positive step in an oldest-first series.
 
-    Used for both the cost-delta additions signal (cost_usd is a monotone running
-    total whose positive steps are clean never-aging additions) and for building
-    the 7d add-profile from fresh used% increments.
+    Used for the cost-delta additions signal: cost_usd is a monotone per-session
+    running total whose positive steps are clean never-aging additions.
     """
     out: list[tuple[float, float]] = []
     prev: float | None = None
@@ -441,8 +441,11 @@ def _future_additions_fn(
 
     * **5h** — hold the live ``base_rate`` for ``burst_horizon_seconds``, then revert
       toward the recent ``baseline`` with ``revert_tau_seconds`` (a burst fades).
-    * **7d** — revert the live rate toward ``baseline`` immediately with the long
-      ``revert_tau_7d_seconds`` (a live blip is tiny over a week).
+    * **7d** — a 30-min slope must NOT be extrapolated across a week. Hold it only
+      for ``burst_horizon_7d_seconds`` (a few hours), then decay toward ZERO with the
+      short ``revert_tau_7d_seconds``. So a recent burst contributes a few hours of
+      additions, not days — the rolling 7d figure then comes from current ± roll-off,
+      which is the robust signal at that timescale.
 
     Idle (no recent fresh reading / no recent spend) → 0. The same closure is
     sampled by the decay simulation at intermediate horizons, so the predicted curve
@@ -451,11 +454,12 @@ def _future_additions_fn(
     if idle or (base_rate <= 0.0 and baseline <= 0.0):
         return lambda dt: 0.0
     if which == "7d":
-        horizon, tau = 0.0, cfg.revert_tau_7d_seconds
+        # Revert toward 0 (not the co-elevated recent baseline) over a few hours.
+        horizon, tau, target = cfg.burst_horizon_7d_seconds, cfg.revert_tau_7d_seconds, 0.0
     else:
-        horizon, tau = cfg.burst_horizon_seconds, cfg.revert_tau_seconds
+        horizon, tau, target = cfg.burst_horizon_seconds, cfg.revert_tau_seconds, baseline
     return lambda dt: max(
-        0.0, _integrate_mean_reverting(base_rate, baseline, horizon, max(0.0, dt), tau)
+        0.0, _integrate_mean_reverting(base_rate, target, horizon, max(0.0, dt), tau)
     )
 
 
@@ -511,6 +515,7 @@ def forecast_window(
     *,
     cfg: ForecastCfg | None = None,
     cap: float | None = None,
+    decay_cum=None,
 ) -> WindowForecast:
     """PRIMARY layered projector (pure).
 
@@ -595,13 +600,19 @@ def forecast_window(
     # --- L2: forward roll-off sim → peak rolling used%. Calibrate pp-per-$ from
     # recent co-occurring (used%, $) deltas; with a calibration + history the
     # decay term is real, else it vanishes and this is the additive value-at-reset.
-    pp_per_dollar = _pp_per_dollar(
-        fresh_samples, cost_rows, now, cfg.slope_window_seconds, cfg.slope_bucket_seconds
-    )
-    if pp_per_dollar is not None and add_buckets:
-        cum_at, has_decay = _cum_pp_lookup(add_buckets, pp_per_dollar)
+    if decay_cum is not None:
+        # Caller supplied a precomputed global cumulative-additions lookup (the chart
+        # replay does this once instead of rebuilding it per evaluated point).
+        cum_at, has_decay = decay_cum, True
     else:
-        cum_at, has_decay = (lambda t: 0.0), False
+        pp_per_dollar = _pp_per_dollar(
+            fresh_samples, cost_rows, now,
+            cfg.slope_window_seconds, cfg.slope_bucket_seconds,
+        )
+        if pp_per_dollar is not None and add_buckets:
+            cum_at, has_decay = _cum_pp_lookup(add_buckets, pp_per_dollar)
+        else:
+            cum_at, has_decay = (lambda t: 0.0), False
 
     projected = _simulate_peak(
         current_pct, future_fn, cum_at, now, secs, window_length, cfg.decay_sim_steps
@@ -697,6 +708,29 @@ def window_inputs(
     return fresh, cost
 
 
+def build_decay_cum(samples: list[dict], which: str, now: float, cfg: ForecastCfg):
+    """Precompute a global calibrated cumulative-additions lookup ``cum_at(t)``.
+
+    For the dashboard's pace replay, building the roll-off decay profile per
+    evaluated point is O(window) each; instead we calibrate pp-per-$ and the
+    cumulative pp-added curve ONCE over a window-spanning sample set and inject the
+    result into :func:`forecast_window` via ``decay_cum=`` (an O(log n) lookup per
+    point). Returns ``cum_at`` (absolute-time cumulative pp added), or ``None`` when
+    there's no calibratable spend (the forecast then drops the decay term).
+    """
+    ts_all = [s["ts"] for s in samples if s.get("ts") is not None] if samples else []
+    if not ts_all:
+        return None
+    fresh, cost_rows = window_inputs(samples, which, now, cfg)
+    span = max(1.0, now - min(ts_all))
+    pp = _pp_per_dollar(fresh, cost_rows, now, span + 1.0, cfg.slope_bucket_seconds)
+    add_buckets = _account_add_buckets(cost_rows, cfg.decay_bucket_seconds)
+    if pp is None or not add_buckets:
+        return None
+    cum_at, _ = _cum_pp_lookup(add_buckets, pp)
+    return cum_at
+
+
 def forecast_for_window(
     which: str,
     used_pct: float | None,
@@ -723,7 +757,12 @@ def forecast_for_window(
         eff_cap = cfg.cap if cap is None else cap
         return forecast_from_period_start(used_pct, window_length, resets_at, now, eff_cap)
     fresh, cost = window_inputs(samples, which, now, cfg)
+    # Calibrate the roll-off and the long-run rate from the same window-spanning
+    # samples. 7d reverts toward the long-run rate (not a 30-min slope); 5h keeps
+    # its recent baseline (its short burst horizon already tames a spike).
+    decay_cum = build_decay_cum(samples, which, now, cfg)
     return forecast_window(
         used_pct, resets_at, now, window_length,
         fresh_samples=fresh, cost_rows=cost, which=which, cfg=cfg, cap=cap,
+        decay_cum=decay_cum,
     )
