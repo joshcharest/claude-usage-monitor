@@ -56,6 +56,14 @@ def overage(which: str, window_seconds: float | None, over_pct: float = 100.0) -
     return queries.overage_spend_usd(which, over_pct=over_pct, since=since, now=now)
 
 
+@st.cache_data(ttl=6)
+def overage_since(which: str, since: float | None, over_pct: float = 100.0) -> float:
+    """Notional $ burned while ``which`` was at/over the cap since an ABSOLUTE
+    epoch (e.g. the start of the month). ``since`` is stable, so it caches well."""
+    return queries.overage_spend_usd(
+        which, over_pct=over_pct, since=since, now=time.time())
+
+
 @st.cache_data(ttl=60)
 def session_labels(_gen: str) -> dict:
     return queries.session_labels()

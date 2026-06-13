@@ -167,6 +167,24 @@ def test_overage_since_bounds_the_scan(env):
     assert queries.overage_spend_usd("7d", since=now, now=now + 10) == pytest.approx(3.0)
 
 
+def test_overage_any_window_dedupes(env):
+    now = 1_000_000.0
+    f = int(now + 200000)
+    db.ingest(Sample(ts=now + 1, session_id="s", used_pct_5h=100.0, resets_at_5h=f,
+                     used_pct_7d=100.0, resets_at_7d=f, cost_usd=0.0))   # seed
+    db.ingest(Sample(ts=now + 2, session_id="s", used_pct_5h=100.0, resets_at_5h=f,
+                     used_pct_7d=100.0, resets_at_7d=f, cost_usd=10.0))  # +10, BOTH over
+    db.ingest(Sample(ts=now + 3, session_id="s", used_pct_5h=10.0, resets_at_5h=f,
+                     used_pct_7d=100.0, resets_at_7d=f, cost_usd=14.0))  # +4, 7d only
+    db.ingest(Sample(ts=now + 4, session_id="s", used_pct_5h=10.0, resets_at_5h=f,
+                     used_pct_7d=10.0, resets_at_7d=f, cost_usd=20.0))   # +6, neither
+    # per-window:
+    assert queries.overage_spend_usd("5h", now=now + 10) == pytest.approx(10.0)
+    assert queries.overage_spend_usd("7d", now=now + 10) == pytest.approx(14.0)
+    # "any" counts the both-over interval ONCE (10 + 4 = 14), not 10+14 = 24.
+    assert queries.overage_spend_usd("any", now=now + 10) == pytest.approx(14.0)
+
+
 def test_overage_degrades_when_budget_db_missing(env):
     assert not db.db_path().exists()
     assert queries.overage_spend_usd("7d", now=0.0) == 0.0

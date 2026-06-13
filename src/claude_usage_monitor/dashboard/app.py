@@ -97,6 +97,22 @@ st.markdown(
         font-size: 1.55rem; line-height: 1.15;
       }
 
+      /* KPI status coloring: the tile itself (border + faint tint) signals the
+         projection status, replacing the old "on pace" delta pill so every tile
+         is the same height. Keyed containers from kpi.py expose st-key-… classes. */
+      [class*="st-key-kpitile-ok-"] [data-testid="stMetric"] {
+        border-color: rgba(34, 197, 94, 0.45);
+        background: rgba(34, 197, 94, 0.08);
+      }
+      [class*="st-key-kpitile-warn-"] [data-testid="stMetric"] {
+        border-color: rgba(245, 158, 11, 0.50);
+        background: rgba(245, 158, 11, 0.10);
+      }
+      [class*="st-key-kpitile-over-"] [data-testid="stMetric"] {
+        border-color: rgba(239, 68, 68, 0.55);
+        background: rgba(239, 68, 68, 0.12);
+      }
+
       /* In-tab context KPIs (e.g. the Pace Current/Projected/Status row) get an
          accent left-rail so the eye ties them to the chart that follows. */
       .stTabs [data-testid="stMetric"] {
@@ -147,7 +163,6 @@ def _sidebar(config: dict) -> prep.Controls:
     st.sidebar.title("Claude Usage")
 
     range_label = st.sidebar.radio("Range", list(prep.RANGES), index=1, horizontal=True)
-    window_focus = st.sidebar.radio("Pace window", ["5h", "7d"], horizontal=True)
 
     gen = data.generation()
     repo_options = ["All", *data.repos(gen)]
@@ -183,7 +198,6 @@ def _sidebar(config: dict) -> prep.Controls:
 
     return prep.Controls(
         range_label=range_label,
-        window_focus=window_focus,
         repo=None if repo == "All" else repo,
         search=search or None,
         live=live,
@@ -208,25 +222,39 @@ def main_render() -> None:
 
     @st.fragment(run_every=refresh)
     def _kpi_row():
-        kpi.render_kpis(prep.build_kpis(data.current_reading(), config, time.time()))
+        now = time.time()
+        cap = float(config.get("alerts", {}).get("over_limit_pct", 100.0))
+        # Notional $ used while over the cap on EITHER window, THIS calendar month.
+        overage = data.overage_since("any", prep.month_start_epoch(now), cap)
+        kpi.render_kpis(
+            prep.build_kpis(data.current_reading(), config, now, overage))
 
     _kpi_row()
 
-    tab_time, tab_pace, tab_usage, tab_models, tab_effort, tab_conv = st.tabs(
-        ["Time", "Pace", "Usage", "Models", "Effort", "Conversations"]
+    # Pace first so it's the default tab on load (Streamlit selects tab[0]);
+    # split into a 5h and a 7d tab (identical layout, per window).
+    (tab_pace5, tab_pace7, tab_time, tab_usage,
+     tab_models, tab_effort, tab_conv) = st.tabs(
+        ["5h Pace", "7d Pace", "Time", "Usage", "Models", "Effort", "Conversations"]
     )
+
+    with tab_pace5:
+        @st.fragment(run_every=refresh)
+        def _pace5():
+            panels.render_pace(controls, config, "5h")
+        _pace5()
+
+    with tab_pace7:
+        @st.fragment(run_every=refresh)
+        def _pace7():
+            panels.render_pace(controls, config, "7d")
+        _pace7()
 
     with tab_time:
         @st.fragment(run_every=refresh)
         def _time():
             panels.render_time(controls, config)
         _time()
-
-    with tab_pace:
-        @st.fragment(run_every=refresh)
-        def _pace():
-            panels.render_pace(controls, config)
-        _pace()
 
     with tab_usage:
         @st.fragment(run_every="30s" if controls.live else None)

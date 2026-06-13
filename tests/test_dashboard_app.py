@@ -53,9 +53,10 @@ def test_app_runs_with_data(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch, with_samples=True)
     at = AppTest.from_file(APP, default_timeout=30).run()
     assert not at.exception
-    # The six tabs render.
+    # The tabs render (Pace is split into a 5h and a 7d tab).
     labels = {t.label for t in at.tabs}
-    assert {"Time", "Pace", "Usage", "Models", "Effort", "Conversations"} <= labels
+    assert {"5h Pace", "7d Pace", "Time", "Usage", "Models",
+            "Effort", "Conversations"} <= labels
     # KPI metrics present.
     assert len(at.metric) >= 3
 

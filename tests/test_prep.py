@@ -8,9 +8,18 @@ import pytest
 pd = pytest.importorskip("pandas")
 
 from datetime import datetime  # noqa: E402
+from zoneinfo import ZoneInfo  # noqa: E402
 
 from claude_usage_monitor.config import load_config  # noqa: E402
 from claude_usage_monitor.dashboard import prep  # noqa: E402
+
+
+def test_month_start_epoch():
+    tz = ZoneInfo("America/New_York")
+    # 2026-06-13 12:34:56 in NY -> month start is 2026-06-01 00:00 NY.
+    now = datetime(2026, 6, 13, 12, 34, 56, tzinfo=tz).timestamp()
+    start = prep.month_start_epoch(now, tz=tz)
+    assert datetime.fromtimestamp(start, tz) == datetime(2026, 6, 1, 0, 0, tzinfo=tz)
 
 
 def test_to_local_matches_system_wall_clock():
@@ -56,13 +65,17 @@ def test_controls_window_seconds():
     assert prep.Controls(range_label="All").window_seconds is None
 
 
+_KPI_LABELS = [
+    "5 Hour Used", "5 Hour Projected", "Time Left",
+    "7 Day Used", "7 Day Projected", "Time Left", "Over-limit Spend",
+]
+
+
 def test_build_kpis_empty():
     kpis = prep.build_kpis(None, load_config(), now=0.0)
-    assert [k.label for k in kpis] == [
-        "5 Hour Used", "5 Hour Projected", "Time Left",
-        "7 Day Used", "7 Day Projected", "Time Left",
-    ]
+    assert [k.label for k in kpis] == _KPI_LABELS
     assert all(k.value == "—" for k in kpis)
+    assert all(k.status is None for k in kpis)
 
 
 def test_build_kpis_with_sample():
@@ -77,16 +90,29 @@ def test_build_kpis_with_sample():
         "model": "claude-opus-4-8",
         "effort": "high",
     }
-    kpis = prep.build_kpis(latest, config, now)
-    # Six tiles in order: 5h trio then 7d trio.
-    assert [k.label for k in kpis] == [
-        "5 Hour Used", "5 Hour Projected", "Time Left",
-        "7 Day Used", "7 Day Projected", "Time Left",
-    ]
+    kpis = prep.build_kpis(latest, config, now, overage_usd=42.5)
+    # 5h trio, 7d trio, then the over-limit-spend tile.
+    assert [k.label for k in kpis] == _KPI_LABELS
     assert kpis[0].value == "30%"      # 5 Hour Used
     assert kpis[1].value == "60%"      # 5 Hour Projected (half-elapsed -> 60%)
+    assert kpis[1].status == "ok"      # 60% < warn 90% -> on pace (green tile)
     assert kpis[2].value == "2h30m"    # Time Left until 5h reset (9000 s)
     assert kpis[3].value == "40%"      # 7 Day Used
+    assert kpis[6].value == "$42.50"   # Over-limit Spend
+
+
+def test_build_kpis_projected_status_thresholds():
+    config = load_config()
+    now = 1_000_000.0
+
+    def proj_status(used_5h):
+        # half-elapsed 5h window -> projected = used / 0.5 = 2 * used
+        latest = {"used_pct_5h": used_5h, "resets_at_5h": now + 18000 / 2}
+        return prep.build_kpis(latest, config, now)[1].status
+
+    assert proj_status(30.0) == "ok"     # proj 60%  < warn 90
+    assert proj_status(47.0) == "warn"   # proj 94%  in [90, 100)
+    assert proj_status(60.0) == "over"   # proj 120% >= 100
 
 
 def test_usage_frame_long_format():
@@ -221,6 +247,21 @@ def test_usage_accumulation_ignores_future_reset_boundary():
     assert not df.empty
     assert df["time"].nunique() == 1
     assert df["used_pct"].sum() == pytest.approx(10.0)
+
+
+def test_usage_accumulation_cumulative_monotonic():
+    # used% dips (rolling/aging), but cumulative=True must only climb.
+    series = [
+        {"ts": 0.0, "session_id": "s1", "used_pct": 20.0, "cost_usd": 1.0},
+        {"ts": 70.0, "session_id": "s1", "used_pct": 50.0, "cost_usd": 2.0},
+        {"ts": 140.0, "session_id": "s1", "used_pct": 35.0, "cost_usd": 3.0},  # dip
+        {"ts": 210.0, "session_id": "s1", "used_pct": 60.0, "cost_usd": 4.0},
+    ]
+    df = prep.usage_accumulation_frame(series, {}, bucket_seconds=60, cumulative=True)
+    total = df.groupby("time")["used_pct"].sum().sort_index()
+    # running max -> non-decreasing, and the dip (35) is lifted to the prior peak.
+    assert list(total) == pytest.approx([20.0, 50.0, 50.0, 60.0])
+    assert (total.diff().dropna() >= 0).all()
 
 
 def test_usage_accumulation_empty():

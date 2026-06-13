@@ -96,18 +96,21 @@ def render_time(controls: Controls, config: dict) -> None:
             st.metric("Resets in", prep.fmt_duration(pos["remaining_secs"]))
 
 
-def render_pace(controls: Controls, config: dict) -> None:
-    """Window usage over time, stacked by conversation, with reference lines."""
-    which = controls.window_focus
+def render_pace(controls: Controls, config: dict, which: str) -> None:
+    """Pace for one window ("5h" or "7d"): a rolling worst-case projection (left)
+    and the accumulated fill of the CURRENT window (right). The two Pace tabs call
+    this with their window, so the layouts are identical bar the time scale.
+
+    The reference line marks where the current period STARTED — taken authorita-
+    tively from the live reading (``resets_at - window``), not from reset-event
+    detection (which records messy historical boundaries)."""
     _render_alert_banner(config, time.time())
+    now = time.time()
     series = data.pace_rows(which, controls.window_seconds)
     if not series:
         st.info("No pace data in this range yet — the live statusline monitor "
                 "needs to record samples first.")
         return
-
-    # (Current / Projected / Status are already shown in the page-top KPI row,
-    # so the Pace tab goes straight to the charts to avoid the duplication.)
 
     # Keep branch labels fresh during live refresh (throttled to ~15s).
     try:
@@ -116,37 +119,43 @@ def render_pace(controls: Controls, config: dict) -> None:
         pass
     labels = data.session_labels(data.generation())
     win_len = prep.window_length(config, which)
-    bucket = prep.pace_bucket_seconds(win_len, series)  # size to the focused window
-    smooth = prep.pace_smooth_buckets(bucket)  # ~10-min rolling-average window
+    bucket = prep.pace_bucket_seconds(win_len, series)
+    smooth = prep.pace_smooth_buckets(bucket)
     warn = float(config.get("alerts", {}).get("warn_projected_pct", 90))
-    resets = prep.pace_reset_times(series)
+    multiday = win_len >= 86400  # 7d -> the time axis needs dates, not just clock
 
-    # LEFT: account-wide worst-case PROJECTION over the focused window — a single
-    # trajectory (not split by conversation).
+    # Authoritative current-period start from the live reading: resets_at - window.
+    latest = data.current_reading()
+    reset_at = latest.get(f"resets_at_{which}") if latest else None
+    period_start = prep.to_local([float(reset_at) - win_len])[0] if reset_at else None
+    reset_end = prep.to_local([float(reset_at)])[0] if reset_at else None
+    reset_lines = [period_start] if period_start is not None else []
+
+    # LEFT: worst-case projection over a ROLLING last-`win_len` view.
     proj = prep.pace_projection_frame(series, bucket, smooth_buckets=smooth)
+    proj_domain = (prep.to_local([now - win_len])[0], prep.to_local([now])[0])
+    if not proj.empty:
+        proj = proj[proj["time"] >= proj_domain[0]]
 
-    # RIGHT: actual fill of the CURRENT 5h window, split by conversation.
-    # Independent of the focused window above: when the focus IS 5h these resolve
-    # to the same cached rows; when it's 7d we still fetch the 5h series so the
-    # fill chart stays 5h-scoped.
-    win_5h = prep.window_length(config, "5h")
-    series_5h = data.pace_rows("5h", controls.window_seconds)
-    resets_5h = prep.pace_reset_times(series_5h)
-    bucket_5h = prep.pace_bucket_seconds(win_5h, series_5h)
+    # RIGHT: accumulated fill of the CURRENT window [period_start, reset]. The
+    # period start is the accumulation cutoff so the fill restarts at the reset.
     acc = prep.usage_accumulation_frame(
-        series_5h, labels, bucket_5h, reset_times=resets_5h,
-        current_window_only=True, window_seconds=win_5h,
+        series, labels, bucket, reset_times=reset_lines,
+        current_window_only=True, window_seconds=win_len, cumulative=True,
     )
+    win_domain = (period_start, reset_end) if period_start is not None else None
 
     if proj.empty and acc.empty:
         st.caption("Not enough samples yet.")
         return
 
     avg_min = max(1, round(smooth * bucket / 60))
-    reset_note = (
-        f" Cyan line{'s' if len(resets) != 1 else ''} mark where the {which} "
-        f"window reset." if resets else ""
-    )
+    reset_note = " The cyan line marks where the current period started." if reset_lines else ""
+
+    # Fixed shared y-axis top (0–150) so both charts ALIGN: identical gridlines
+    # and y-label widths, which makes their plot areas — and thus x-axis lengths —
+    # equal under width="stretch". A projection above 150% clips at the top.
+    y_top = 150.0
 
     # Side-by-side so both charts fit above the fold. Only the right chart is
     # split by conversation, so its legend is suppressed and drawn once below.
@@ -157,14 +166,17 @@ def render_pace(controls: Controls, config: dict) -> None:
             st.caption("Not enough samples yet.")
         else:
             st.altair_chart(
-                _projection_chart(proj, warn, resets), width="stretch")
+                _projection_chart(proj, warn, reset_lines, x_domain=proj_domain,
+                                  y_top=y_top, with_date=multiday), width="stretch")
     with right:
-        st.markdown("**Total usage — current 5h window fill (%)**")
+        st.markdown(f"**Total usage — accumulated over the current {which} window (%)**")
         if acc.empty:
             st.caption("No usage data in this range yet.")
         else:
             st.altair_chart(
-                _cumulative_usage_chart(acc, resets_5h, legend=False), width="stretch")
+                _cumulative_usage_chart(acc, reset_lines, legend=False,
+                                        x_domain=win_domain, y_top=y_top,
+                                        with_date=multiday), width="stretch")
 
     legend = _shared_conv_legend(acc)
     if legend is not None:
@@ -173,15 +185,17 @@ def render_pace(controls: Controls, config: dict) -> None:
     with st.expander("Chart notes"):
         st.caption(
             f"**Left — projected usage.** Account-wide worst-case projection of the "
-            f"{which}-window used % over time: each sample's run-rate forecast to the "
-            f"window end, peak per ~{int(bucket)}s bucket then a centered "
-            f"~{avg_min}-min rolling average. Dashed lines: amber warn {warn:.0f}% "
-            f"and slate ceiling 100%.{reset_note}"
+            f"{which}-window used % over a rolling last-{which} view: each sample's "
+            f"run-rate forecast to the window end, peak per ~{int(bucket)}s bucket "
+            f"then a centered ~{avg_min}-min rolling average. Dashed lines: amber "
+            f"warn {warn:.0f}% and slate ceiling 100%.{reset_note}"
         )
         st.caption(
-            "**Right — total usage.** Current 5h window's fill level (0–100 %): "
-            "the rolling used % since its last reset (rises and falls), split by $ "
-            "spent per conversation. The cyan line marks the window reset."
+            f"**Right — total usage.** Accumulated used % over the current {which} "
+            "window: the running high-water mark since the period started, so it "
+            "only climbs, split by each conversation's share of the cumulative $ "
+            "spent. The x-axis spans the full window, so the gap to the right edge "
+            "is the time left until reset; the cyan line marks the period start."
         )
 
 
@@ -240,7 +254,7 @@ _ANNOTATION = "#cbd5e1"      # slate-300, lifts labels above grid text
 
 # Shared height for the two side-by-side Pace charts: tall enough to fill the
 # viewport once the KPI tiles are compacted, while still fitting without scroll.
-_CHART_H = 400
+_CHART_H = 540
 
 
 def _time_axis(df) -> alt.Axis:
@@ -253,6 +267,17 @@ def _time_axis(df) -> alt.Axis:
     except Exception:
         pass
     return alt.Axis(format=fmt, labelAngle=0, tickCount=6, grid=False)
+
+
+def _clock_axis(*, with_date: bool = False) -> alt.Axis:
+    """X time axis as a 12-hour clock (never military). ``with_date`` adds the
+    month/day for multi-day spans (the 7d window); otherwise it's time-only
+    (e.g. '3:45 PM'). Leading zeros on hour/day are stripped via a Vega expr."""
+    if with_date:
+        expr = "replace(timeFormat(datum.value, '%b %d %I%p'), / 0/g, ' ')"  # 'Jun 6 6PM'
+    else:
+        expr = "replace(timeFormat(datum.value, '%I:%M %p'), /^0/, '')"      # '3:45 PM'
+    return alt.Axis(labelExpr=expr, labelAngle=0, tickCount=6, grid=False)
 
 
 def _reset_lines(resets):
@@ -295,22 +320,29 @@ def _shared_conv_legend(*frames):
     )
 
 
-def _cumulative_usage_chart(df, resets=None, *, legend: bool = True):
-    # Pin x to the current window's own data span so older resets (or sparse
-    # early samples) can't stretch the axis back before this 5h period.
-    x_min, x_max = df["time"].min(), df["time"].max()
+def _cumulative_usage_chart(df, resets=None, *, legend: bool = True, x_domain=None,
+                            y_top=None, with_date=False):
+    # Pin x to the FULL current window when given (so the chart shows the whole
+    # 5h span — elapsed fill plus the remaining time to reset); otherwise fall
+    # back to the data's own span.
+    if x_domain is not None and x_domain[0] is not None and x_domain[1] is not None:
+        x_min, x_max = x_domain
+    else:
+        x_min, x_max = df["time"].min(), df["time"].max()
+    y_max = float(y_top) if y_top is not None else 100.0
     area = (
         alt.Chart(df)
         .mark_area(fillOpacity=0.55, strokeOpacity=0.9, strokeWidth=0.5)
         .encode(
-            x=alt.X("time:T", title=None, axis=_time_axis(df),
+            x=alt.X("time:T", title=None, axis=_clock_axis(with_date=with_date),
                     scale=alt.Scale(domain=[x_min, x_max], nice=False)),
             y=alt.Y("used_pct:Q", stack=True, title="used %",
-                    scale=alt.Scale(domain=[0, 100]),
+                    scale=alt.Scale(domain=[0, y_max]),
                     axis=alt.Axis(format="d", tickCount=5)),
             color=_conv_color(df, legend=legend),
             tooltip=[
-                alt.Tooltip("time:T", title="time", format="%Y-%m-%d %H:%M"),
+                alt.Tooltip("time:T", title="time",
+                            format="%b %d, %I:%M %p" if with_date else "%I:%M %p"),
                 alt.Tooltip("conversation:N", title="conversation"),
                 alt.Tooltip("used_pct:Q", title="used %", format=".0f"),
             ],
@@ -326,12 +358,23 @@ def _cumulative_usage_chart(df, resets=None, *, legend: bool = True):
     return alt.layer(*layers).properties(width="container", height=_CHART_H)
 
 
-def _projection_chart(df, warn: float, resets=None):
+def _projection_chart(df, warn: float, resets=None, *, x_domain=None, y_top=None,
+                      with_date=False):
     """Account-wide worst-case PROJECTED used % over time — one trajectory (not
-    split by conversation), with the warn and ceiling reference lines."""
+    split by conversation), with the warn and ceiling reference lines. ``x_domain``
+    pins the time axis (e.g. a rolling window); the axis is a 12-hour clock, with
+    the date added when ``with_date`` (multi-day 7d view). ``y_top`` pins the
+    y-axis so it can be shared with the fill chart for aligned gridlines."""
     # Headroom above the data so a projection over 100% stays readable, but cap
     # it so a freak spike can't flatten the whole series against the floor.
-    top = min(200.0, max(105.0, float(df["projected_pct"].max()) + 5.0))
+    top = float(y_top) if y_top is not None else (
+        min(200.0, max(105.0, float(df["projected_pct"].max()) + 5.0))
+    )
+    x_scale = (
+        alt.Scale(domain=list(x_domain), nice=False)
+        if x_domain is not None and x_domain[0] is not None and x_domain[1] is not None
+        else alt.Undefined
+    )
     area = (
         alt.Chart(df)
         .mark_area(
@@ -339,12 +382,14 @@ def _projection_chart(df, warn: float, resets=None):
             line={"color": _ACCENT, "strokeWidth": 2},
         )
         .encode(
-            x=alt.X("time:T", title=None, axis=_time_axis(df)),
+            x=alt.X("time:T", title=None, axis=_clock_axis(with_date=with_date),
+                    scale=x_scale),
             y=alt.Y("projected_pct:Q", title="projected %",
                     scale=alt.Scale(domain=[0, top]),
                     axis=alt.Axis(format="d", tickCount=5)),
             tooltip=[
-                alt.Tooltip("time:T", title="time", format="%Y-%m-%d %H:%M"),
+                alt.Tooltip("time:T", title="time",
+                            format="%b %d, %I:%M %p" if with_date else "%I:%M %p"),
                 alt.Tooltip("projected_pct:Q", title="projected %", format=".0f"),
             ],
         )
@@ -367,8 +412,12 @@ def _projection_chart(df, warn: float, resets=None):
         .encode(x=alt.value(6), y="y:Q", text="label:N")
     )
     layers = [area, warn_rule, ceil_rule, warn_label, ceil_label]
-    if resets:
-        layers.append(_reset_lines(resets))
+    rs = resets or []
+    if x_scale is not alt.Undefined:
+        lo, hi = x_domain
+        rs = [r for r in rs if lo <= r <= hi]  # only resets inside the pinned window
+    if rs:
+        layers.append(_reset_lines(rs))
     return alt.layer(*layers).properties(width="container", height=_CHART_H)
 
 

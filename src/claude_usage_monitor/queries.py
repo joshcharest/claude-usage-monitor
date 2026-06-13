@@ -345,6 +345,9 @@ def overage_spend_usd(
 ) -> float:
     """Notional $ accrued while the ``which`` window was AT/OVER ``over_pct``.
 
+    ``which`` is "5h", "7d", or "any" (either window over the cap — de-duplicated,
+    so a sample over on both windows is counted once).
+
     ``cost_usd`` is a per-session running total (monotonic), so the spend in an
     interval is the positive diff of consecutive samples of the SAME session.
     ``used_pct_*`` is the ACCOUNT-WIDE rolling counter, reported (identically,
@@ -357,29 +360,35 @@ def overage_spend_usd(
     afford it every tick even for the 7d period. ``since`` bounds the scan to the
     current period start; ``None`` means all history. Returns 0.0 on any miss.
     """
-    used_col, reset_col = _OVERAGE_COLS.get(which, _OVERAGE_COLS["7d"])
     conn, own = _open_budget(budget_conn)
     if conn is None:
         return 0.0
     try:
-        where = [
-            "prev IS NOT NULL",
-            f"{used_col} >= ?",
-            f"{reset_col} IS NOT NULL",
-            f"{reset_col} > ts",
-            "cost_usd IS NOT NULL",
-        ]
-        params: list[Any] = [over_pct]
+        if which == "any":
+            over_clause = (
+                "((used_pct_5h >= ? AND resets_at_5h IS NOT NULL AND resets_at_5h > ts) "
+                "OR (used_pct_7d >= ? AND resets_at_7d IS NOT NULL AND resets_at_7d > ts))"
+            )
+            over_params: list[Any] = [over_pct, over_pct]
+        else:
+            used_col, reset_col = _OVERAGE_COLS.get(which, _OVERAGE_COLS["7d"])
+            over_clause = (
+                f"({used_col} >= ? AND {reset_col} IS NOT NULL AND {reset_col} > ts)"
+            )
+            over_params = [over_pct]
+        params: list[Any] = []
         ts_filter = ""
         if since is not None:
             ts_filter = "WHERE ts >= ?"
-            params.insert(0, since)
+            params.append(since)
+        params += over_params
         sql = (
-            f"WITH s AS (SELECT ts, {used_col}, {reset_col}, cost_usd, "
-            f"  LAG(cost_usd) OVER (PARTITION BY session_id ORDER BY ts) AS prev "
+            "WITH s AS (SELECT ts, cost_usd, used_pct_5h, resets_at_5h, "
+            "  used_pct_7d, resets_at_7d, "
+            "  LAG(cost_usd) OVER (PARTITION BY session_id ORDER BY ts) AS prev "
             f"  FROM samples {ts_filter}) "
-            f"SELECT COALESCE(SUM(MAX(cost_usd - prev, 0)), 0) AS overage "
-            f"FROM s WHERE {' AND '.join(where)}"
+            "SELECT COALESCE(SUM(MAX(cost_usd - prev, 0)), 0) AS overage "
+            f"FROM s WHERE prev IS NOT NULL AND cost_usd IS NOT NULL AND {over_clause}"
         )
         row = conn.execute(sql, params).fetchone()
         return float(row["overage"]) if row and row["overage"] is not None else 0.0

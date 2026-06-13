@@ -53,6 +53,13 @@ def to_local(ts):
         return out.dt.tz_convert(_LOCAL_TZ).dt.tz_localize(None)
     return out.tz_convert(_LOCAL_TZ).tz_localize(None)
 
+
+def month_start_epoch(now: float, tz=None) -> float:
+    """Epoch seconds for 00:00 on the 1st of ``now``'s month, in LOCAL time."""
+    local = datetime.fromtimestamp(now, tz or _LOCAL_TZ)
+    start = local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return start.timestamp()
+
 # Sidebar time-range options → window length in seconds (None = all history).
 RANGES: dict[str, float | None] = {
     "5h": 18000.0,
@@ -79,11 +86,11 @@ class Controls:
 class Kpi:
     label: str
     value: str
-    delta: str | None = None
-    # "normal" | "inverse" | "off", or an explicit named color that st.metric
-    # applies unconditionally: "red" | "orange" | "green" (Streamlit >=1.58).
-    delta_color: str = "normal"
     help: str | None = None
+    # Drives the tile's own color (border + tint) via a CSS class in kpi.py:
+    # "ok" (on pace) | "warn" | "over" | None (neutral). Replaces the old delta
+    # "pill", so every tile is the same height.
+    status: str | None = None
 
 
 def _cfg(config: dict, *path: str, default: Any = None) -> Any:
@@ -133,13 +140,22 @@ def window_position(
     }
 
 
-def build_kpis(latest: dict | None, config: dict, now: float) -> list[Kpi]:
-    """Top-of-page KPIs: a 5h trio then a 7d trio (Used / Projected / Time left)."""
+def build_kpis(
+    latest: dict | None, config: dict, now: float, overage_usd: float | None = None
+) -> list[Kpi]:
+    """Top-of-page KPIs: a 5h trio, a 7d trio, then an over-limit-spend tile.
+
+    The two Projected tiles carry a ``status`` ("ok"/"warn"/"over") that colors the
+    tile itself; ``overage_usd`` (notional $ spent while over the cap) populates the
+    far-right tile.
+    """
     warn = float(_cfg(config, "alerts", "warn_projected_pct", default=90.0))
+    money = (f"${overage_usd:,.2f}" if overage_usd is not None else "—")
     if not latest:
         return [
             Kpi("5 Hour Used", "—"), Kpi("5 Hour Projected", "—"), Kpi("Time Left", "—"),
             Kpi("7 Day Used", "—"), Kpi("7 Day Projected", "—"), Kpi("Time Left", "—"),
+            Kpi("Over-limit Spend", money, help="notional $ used while over the limit, this month"),
         ]
 
     fc5 = forecast_from_period_start(
@@ -153,26 +169,29 @@ def build_kpis(latest: dict | None, config: dict, now: float) -> list[Kpi]:
         return f"{v:.0f}%" if v is not None else "—"
 
     def proj_status(fc):
-        # Named colors apply unconditionally (Streamlit >=1.58); st.metric only
-        # sign-colors deltas it can parse a +/- from, which these status strings
-        # lack. Over the warn threshold = caution (red); otherwise on pace (green).
-        if fc.projected_pct is None:
-            return None, "off"
-        over = fc.projected_pct >= warn
-        return ("over budget" if over else "on pace"), ("red" if over else "green")
-
-    s5, k5 = proj_status(fc5)
-    s7, k7 = proj_status(fc7)
+        # Tile color: >=100% over (red), >=warn caution (amber), else on pace
+        # (green). Judge by the projection when it's meaningful; early in a window
+        # (on_pace None) the projection is noisy, so judge by current used% instead
+        # so the tile still shows a sensible color rather than going neutral.
+        basis = fc.projected_pct if fc.on_pace is not None else fc.current_pct
+        if basis is None:
+            return None
+        if basis >= 100.0:
+            return "over"
+        if basis >= warn:
+            return "warn"
+        return "ok"
 
     return [
         Kpi("5 Hour Used", pct(fc5.current_pct)),
-        Kpi("5 Hour Projected", pct(fc5.projected_pct), s5, k5),
+        Kpi("5 Hour Projected", pct(fc5.projected_pct), status=proj_status(fc5)),
         Kpi("Time Left", fmt_duration(fc5.secs_to_reset),
             help="until the 5h window resets"),
         Kpi("7 Day Used", pct(fc7.current_pct)),
-        Kpi("7 Day Projected", pct(fc7.projected_pct), s7, k7),
+        Kpi("7 Day Projected", pct(fc7.projected_pct), status=proj_status(fc7)),
         Kpi("Time Left", fmt_duration(fc7.secs_to_reset),
             help="until the 7d window resets"),
+        Kpi("Over-limit Spend", money, help="notional $ used while over the limit, this month"),
     ]
 
 
@@ -306,14 +325,13 @@ def _bucketed(
     return df
 
 
-def _cost_weights(df: pd.DataFrame) -> pd.DataFrame:
-    """Per-(bucket, conversation) weight in [0,1], summing to 1 per bucket.
+def _spend_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(spend, present) wide frames indexed by bucket, columns = conversation.
 
-    Weighted by the $ SPENT in each bucket: ``cost_usd`` is a session running
-    total, so per session we take the last value per bucket, forward-fill, and
-    take the positive diff, then aggregate by conversation. Buckets with no spend
-    fall back to an EQUAL split among the conversations present. Returns a wide
-    frame indexed by bucket, columns = conversation.
+    ``spend`` = $ spent IN each bucket per conversation (``cost_usd`` is a session
+    running total, so per session: last value per bucket, forward-fill, positive
+    diff, aggregated by conversation). ``present`` = 1.0 where a conversation has
+    any sample in a bucket, else 0.0 (for the equal-split fallback).
     """
     buckets = sorted(df["bucket"].unique())
     convs = sorted(df["conversation"].unique())
@@ -326,17 +344,37 @@ def _cost_weights(df: pd.DataFrame) -> pd.DataFrame:
         conv = sess_to_conv.get(sid)
         if conv in spend.columns:
             spend[conv] = spend[conv].add(delta, fill_value=0.0)
-
     present = (
         df.groupby(["bucket", "conversation"]).size().unstack(fill_value=0)
         .reindex(index=buckets, columns=convs, fill_value=0).gt(0).astype(float)
     )
+    return spend, present
+
+
+def _normalize_weights(spend: pd.DataFrame, present: pd.DataFrame) -> pd.DataFrame:
+    """Row-normalize ``spend`` to weights summing to 1 per bucket; buckets with no
+    spend fall back to an EQUAL split among the conversations present."""
     total = spend.sum(axis=1)
     by_cost = spend.div(total.where(total > 0), axis=0)
     pres_n = present.sum(axis=1)
     equal = present.div(pres_n.where(pres_n > 0, 1), axis=0)
-    # cost split where there was spend; equal split otherwise
     return by_cost.where(total.gt(0), equal)
+
+
+def _cost_weights(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-(bucket, conversation) weight in [0,1], summing to 1 per bucket,
+    weighted by the $ spent IN that bucket. Returns a wide frame indexed by
+    bucket, columns = conversation."""
+    spend, present = _spend_matrix(df)
+    return _normalize_weights(spend, present)
+
+
+def _cost_weights_cumulative(df: pd.DataFrame) -> pd.DataFrame:
+    """Like :func:`_cost_weights`, but weighted by CUMULATIVE $ spent up to each
+    bucket — so an accumulating total is attributed by each conversation's share
+    of the running spend. Before any spend, falls back to an equal split."""
+    spend, present = _spend_matrix(df)
+    return _normalize_weights(spend.cumsum(axis=0), present)
 
 
 def pace_share_frame(
@@ -384,6 +422,21 @@ def pace_share_frame(
 _USAGE_COLS = ["time", "conversation", "used_pct"]
 
 
+def _current_window_cutoff(data_max, reset_times, window_seconds):
+    """Start of the CURRENT window: the most recent reset boundary that has
+    already occurred (<= ``data_max``), else ``data_max - window_seconds``, else
+    None. A future boundary (flaky/advanced resets_at) is ignored so it can't
+    clip the whole series away."""
+    past_resets = sorted(
+        r for r in (pd.Timestamp(t) for t in (reset_times or [])) if r <= data_max
+    )
+    if past_resets:
+        return past_resets[-1]
+    if window_seconds:
+        return data_max - pd.Timedelta(seconds=float(window_seconds))
+    return None
+
+
 def usage_accumulation_frame(
     series: list[dict],
     labels: dict[str, str] | None = None,
@@ -391,21 +444,46 @@ def usage_accumulation_frame(
     reset_times=None,
     current_window_only: bool = False,
     window_seconds: float | None = None,
+    cumulative: bool = False,
 ) -> pd.DataFrame:
-    """Current rolling fill of the focused window (0–100 %), split by conversation.
+    """Fill of the focused window (0–100 %), split by conversation.
 
-    Same peak-of-fresh + cost-weighted split as :func:`pace_share_frame`, but the
-    value is the window's actual rolling fill (it rises AND falls — no high-water
-    latch). ``current_window_only`` clips to the current window: buckets at/after
-    the most recent reset boundary that has ALREADY occurred, or the last
-    ``window_seconds`` if no past reset was detected. A boundary in the future
-    (flaky/advanced ``resets_at`` data) is ignored — it can't start the current
-    window, and using it would clip the whole series away (empty chart). Returns
-    long-format ``(time, conversation, used_pct)``.
+    Same peak-of-fresh + cost-weighted split as :func:`pace_share_frame`. By
+    default the value is the window's rolling fill (it rises AND falls — no
+    high-water latch). With ``cumulative=True`` it instead ACCUMULATES over the
+    window: the running-max of the total used % (so it only climbs), attributed by
+    each conversation's share of the CUMULATIVE $ spent.
+
+    ``current_window_only`` clips to the current window: buckets at/after the most
+    recent reset boundary that has ALREADY occurred, or the last ``window_seconds``
+    if no past reset was detected. A boundary in the future (flaky/advanced
+    ``resets_at`` data) is ignored — it can't start the current window, and using
+    it would clip the whole series away (empty chart). Returns long-format
+    ``(time, conversation, used_pct)``.
     """
     df = _bucketed(series, labels, bucket_seconds)
     if df.empty:
         return pd.DataFrame(columns=_USAGE_COLS)
+
+    if cumulative:
+        # Clip to the current window FIRST so accumulation starts at the reset
+        # (not carrying the prior window's high-water), then take the running max.
+        if current_window_only:
+            cutoff = _current_window_cutoff(
+                df["bucket"].max(), reset_times, window_seconds
+            )
+            if cutoff is not None:
+                df = df[df["bucket"] >= cutoff]
+            if df.empty:
+                return pd.DataFrame(columns=_USAGE_COLS)
+        peak = df.groupby("bucket")["used_pct"].max().sort_index().cummax()
+        weights = _cost_weights_cumulative(df).reindex(peak.index).fillna(0.0)
+        band = weights.mul(peak, axis=0)
+        return (
+            band.reset_index().melt(id_vars="bucket", var_name="conversation",
+                                    value_name="used_pct")
+            .rename(columns={"bucket": "time"})[_USAGE_COLS]
+        )
 
     peak = df.groupby("bucket")["used_pct"].max().sort_index()
     weights = _cost_weights(df).reindex(peak.index).fillna(0.0)
@@ -417,17 +495,9 @@ def usage_accumulation_frame(
     )
 
     if current_window_only and not long.empty:
-        data_max = long["time"].max()
-        # Only a reset that has already happened (<= the latest data) can mark the
-        # start of the CURRENT window; a future boundary is a prediction/artifact.
-        past_resets = sorted(
-            r for r in (pd.Timestamp(t) for t in (reset_times or [])) if r <= data_max
+        cutoff = _current_window_cutoff(
+            long["time"].max(), reset_times, window_seconds
         )
-        cutoff = None
-        if past_resets:
-            cutoff = past_resets[-1]
-        elif window_seconds:
-            cutoff = data_max - pd.Timedelta(seconds=float(window_seconds))
         if cutoff is not None:
             long = long[long["time"] >= cutoff]
     return long[_USAGE_COLS]
